@@ -1,0 +1,91 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Accedi a E-Distribuzione",
+        "description": "Usa le stesse credenziali dell'app o del sito ufficiale E-Distribuzione. Dopo l'accesso ti verrà chiesto un codice OTP, ricevuto via email o SMS: sarà inviato da questa configurazione, non usare codici generati sul sito o nell'app. Se hai l'app o il sito aperti, esci prima da lì: E-Distribuzione limita il numero di sessioni contemporanee per account.{pod_correnti}",
+        "data": {
+          "email": "Email",
+          "password": "Password"
+        }
+      },
+      "otp": {
+        "title": "Codice OTP",
+        "description": "Inserisci il codice OTP ricevuto via email o SMS. {avviso}",
+        "data": {
+          "otp": "Codice OTP",
+          "richiedi_nuovo_codice": "Richiedi un nuovo codice (lascia vuoto il campo sopra)"
+        }
+      },
+      "pod": {
+        "title": "Seleziona POD",
+        "description": "Puoi selezionare più di un POD se vuoi monitorarne diversi con questa stessa configurazione.",
+        "data": {
+          "pods": "POD"
+        }
+      }
+    },
+    "error": {
+      "invalid_auth": "Email o password non valide",
+      "cannot_connect": "Impossibile contattare E-Distribuzione",
+      "invalid_otp": "Codice OTP errato o scaduto. Deve essere il codice inviato da questa configurazione: uno generato sul sito o nell'app appartiene a un'altra sessione di login e viene sempre rifiutato.",
+      "otp_mancante": "Inserisci il codice OTP, oppure spunta \"Richiedi un nuovo codice\" per farne inviare uno nuovo",
+      "troppe_sessioni": "E-Distribuzione ha rifiutato l'accesso perché l'account ha troppe sessioni aperte contemporaneamente. Esci dall'app ufficiale e dal sito, attendi qualche minuto e riprova: in questo stato nessun codice OTP viene inviato.",
+      "nessun_pod_selezionato": "Seleziona almeno un POD"
+    },
+    "abort": {
+      "reauth_successful": "Credenziali aggiornate con successo",
+      "no_pods_found": "Nessun POD trovato per questo account",
+      "supplies_failed": "Errore imprevisto nel recupero dei POD dall'account. Riprova la configurazione da capo (login + OTP inclusi).",
+      "otp_exchange_failed": "Il codice OTP è stato accettato ma il completamento dell'accesso è fallito. Riprova la configurazione da capo (login + OTP inclusi)."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Opzioni E-Distribuzione",
+        "menu_options": {
+          "tipo_pod": "Tipo di contatore per POD",
+          "aggiungi_pod": "Aggiungi POD",
+          "rimuovi_pod": "Rimuovi POD",
+          "orario": "Orario della richiesta"
+        }
+      },
+      "tipo_pod": {
+        "title": "Tipo di contatore per POD",
+        "description": "A+/A- descrivono cosa misura E-Distribuzione (prelevata/immessa): restano sempre entrambe acquisite per ogni POD. Il tipo qui sotto descrive solo il ruolo di quel contatore nel tuo impianto, e cambia unicamente i nomi mostrati nella Energy Dashboard - modificabile in ogni momento, non richiede un nuovo import."
+      },
+      "aggiungi_pod": {
+        "title": "Aggiungi POD",
+        "description": "POD attualmente configurati: {pod_correnti}. Sotto trovi quelli disponibili sul tuo account non ancora aggiunti a questa configurazione.",
+        "data": {
+          "pods_da_aggiungere": "POD da aggiungere"
+        }
+      },
+      "rimuovi_pod": {
+        "title": "Rimuovi POD",
+        "description": "Seleziona i POD da rimuovere. I dati storici già importati nelle statistiche esterne non vengono cancellati.",
+        "data": {
+          "pods_da_rimuovere": "POD da rimuovere"
+        }
+      },
+      "orario": {
+        "title": "Orario della richiesta",
+        "description": "Ora locale (0-23) a partire dalla quale chiedere la curva del giorno prima. Attuale: {ora_attuale}:00.",
+        "data": {
+          "ora_richiesta": "Ora"
+        }
+      }
+    },
+    "error": {
+      "non_puoi_rimuoverli_tutti": "Non puoi rimuovere tutti i POD da qui: rimuovi direttamente l'integrazione se vuoi svuotarla del tutto"
+    },
+    "abort": {
+      "nessun_pod": "Non ci sono POD configurati da rimuovere",
+      "nessun_pod_selezionato": "Seleziona almeno un POD da aggiungere",
+      "nessun_pod_da_aggiungere": "Tutti i POD del tuo account sono già configurati qui",
+      "refresh_failed": "Non è stato possibile rinnovare l'accesso a E-Distribuzione. Riprova più tardi; se il problema persiste potrebbe servire un nuovo login (rimuovi e riconfigura l'integrazione).",
+      "supplies_failed": "Errore imprevisto nel recupero dei POD dall'account. Riprova più tardi."
+    }
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "domain": "edistribuzione",
+  "name": "E-Distribuzione",
+  "after_dependencies": [
+    "recorder",
+    "energy"
+  ],
+  "codeowners": [],
+  "config_flow": true,
+  "documentation": "https://github.com/maurobraggio/HomeAssistant-EDistribuzione",
+  "iot_class": "cloud_polling",
+  "issue_tracker": "https://github.com/maurobraggio/HomeAssistant-EDistribuzione/issues",
+  "requirements": [],
+  "version": "0.1.0"
+}

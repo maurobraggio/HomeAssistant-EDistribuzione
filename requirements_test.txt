@@ -1,0 +1,9 @@
+pytest
+pytest-asyncio
+aiohttp
+freezegun
+# Serve solo per i test che importano moduli con dipendenze da Home Assistant
+# (coordinator.py, config_flow.py, sensor.py, statistics.py). I test in
+# test_api.py/test_auth.py non ne hanno bisogno: quei moduli non importano
+# homeassistant.
+pytest-homeassistant-custom-component
