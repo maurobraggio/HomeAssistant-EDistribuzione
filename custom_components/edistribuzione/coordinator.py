@@ -2,9 +2,14 @@
 
 Supporta più POD sulla stessa config entry (stessa credenziale, stessa
 utenza autenticata). Ogni ciclo, per ciascun POD, se è il momento (coda +
-orario): richiede ENTRAMBE le direzioni dell'energia (prelevata e immessa,
-vedi MAGNITUDE_TUTTE in const.py) per il giorno prima, importate come due
-serie separate nella Energy Dashboard.
+orario, al massimo una volta al giorno): richiede ENTRAMBE le direzioni
+dell'energia (prelevata e immessa, vedi MAGNITUDE_TUTTE in const.py) per gli
+ultimi GIORNI_RICONTROLLO giorni (non solo il più recente, per ricontrollare
+eventuali rettifiche di E-Distribuzione su giorni già importati), in
+un'unica richiesta per direzione. La scrittura effettiva nelle external
+statistics ricalcola sempre l'intera serie dal raw storage a 15 minuti (vedi
+statistics.py), quindi una rettifica corregge automaticamente anche le sum
+cumulative successive.
 
 Un giorno esce dalla coda di retry se almeno una delle due direzioni lo ha
 restituito: un POD senza una delle due (es. un contatore normale che non
@@ -38,6 +43,7 @@ from .const import (
     CONF_TIPO_POD,
     DEFAULT_UPDATE_INTERVAL_MINUTES,
     DOMAIN,
+    GIORNI_RICONTROLLO,
     MAGNITUDE_IMMESSA,
     MAGNITUDE_PRELEVATA,
     MAGNITUDE_TUTTE,
@@ -295,14 +301,22 @@ class EdistribuzioneCoordinator(DataUpdateCoordinator[dict]):
         """Decide che intervallo chiedere per questo POD in questo ciclo.
 
         Un POD senza NESSUN dato ancora importato (primo avvio della entry,
-        o un POD aggiunto in seguito dalle opzioni) chiede subito il giorno
-        atteso, a prescindere dall'orario configurato - serve a verificare
-        da subito che POD e token siano validi, invece di scoprirlo solo a
-        sera. Nei cicli successivi aspetta l'orario configurato, poi chiede
-        in UNA SOLA richiesta l'intervallo che va dal più vecchio giorno
-        arretrato fino al giorno atteso - a meno che quest'ultimo non
-        risulti già coperto dalle statistiche esistenti (entrambe le
-        direzioni, vedi async_get_ultima_data_disponibile).
+        o un POD aggiunto in seguito dalle opzioni) chiede subito, a
+        prescindere dall'orario configurato - serve a verificare da subito
+        che POD e token siano validi, invece di scoprirlo solo a sera. Nei
+        cicli successivi aspetta l'orario configurato, poi al massimo una
+        volta al giorno (la stessa 'atteso' resta invariata finché non
+        cambia il giorno) chiede in UNA SOLA richiesta gli ultimi
+        GIORNI_RICONTROLLO giorni fino al giorno atteso - non solo il più
+        recente: E-Distribuzione può rettificare un giorno già pubblicato, e
+        senza questo ricontrollo periodico quella correzione non verrebbe
+        mai vista in automatico (resta comunque recuperabile a mano con
+        recupera_storico).
+
+        Se ci sono giorni arretrati PIU' VECCHI della finestra di
+        ricontrollo (bloccati in coda da un errore precedente), l'intervallo
+        si allarga all'indietro per includerli, sempre in un'unica
+        richiesta.
 
         BUG STORICO (corretto qui): la versione precedente subordinava il
         fetch immediato a CONF_DATA_INSTALLAZIONE, un flag CONDIVISO da tutta
@@ -326,30 +340,36 @@ class EdistribuzioneCoordinator(DataUpdateCoordinator[dict]):
 
         if ultima_disponibile is None:
             _LOGGER.info(
-                "POD %s: nessun dato ancora importato, richiedo subito il %s per "
-                "verificare POD e token. Le richieste successive partiranno dopo le "
-                "%d:00 (modificabile dalle opzioni); per lo storico usa l'azione "
+                "POD %s: nessun dato ancora importato, richiedo subito gli ultimi %d "
+                "giorni per verificare POD e token. Le richieste successive partiranno "
+                "dopo le %d:00 (modificabile dalle opzioni); per lo storico usa l'azione "
                 "edistribuzione.recupera_storico.",
                 pod,
-                atteso,
+                GIORNI_RICONTROLLO,
                 self._ora_richiesta,
             )
-            return atteso, atteso
+        else:
+            adesso = dt_util.now()
+            if adesso.hour < self._ora_richiesta:
+                return None
+            if ultima_disponibile >= atteso:
+                # Già ricontrollato oggi ('atteso' resta lo stesso fino a
+                # mezzanotte): al massimo una richiesta al giorno per POD,
+                # non una ad ogni ciclo orario dopo l'orario configurato.
+                return None
 
-        adesso = dt_util.now()
-        if adesso.hour < self._ora_richiesta:
-            return None
+        inizio_ricontrollo = atteso - timedelta(days=GIORNI_RICONTROLLO - 1)
 
         code = self._leggi_code()
         coda = code.get(pod, {})
-        arretrati = sorted(date.fromisoformat(g) for g in coda if date.fromisoformat(g) < atteso)
-        if arretrati:
-            return max(arretrati[0], atteso - timedelta(days=150)), atteso
+        arretrati = sorted(
+            date.fromisoformat(g) for g in coda if date.fromisoformat(g) < inizio_ricontrollo
+        )
+        inizio = (
+            max(arretrati[0], atteso - timedelta(days=150)) if arretrati else inizio_ricontrollo
+        )
 
-        if ultima_disponibile >= atteso:
-            return None
-
-        return atteso, atteso
+        return inizio, atteso
 
     # ------------------------------------------------------------------
     # Fetch + import, condiviso tra ciclo automatico e recupero storico

@@ -1,0 +1,31 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Ambiente locale / credenziali
+.env
+
+# File di debug generati da scripts/verify_login.py (mai committarli: alcuni
+# contengono dati personali - indirizzo, consumi - o, nel caso del token di
+# refresh, una credenziale vera e propria).
+otp_page_debug.html
+otp_send_debug.html
+otp_submit_response_debug.html
+login_page_decoded.html
+daily_load_profile_debug.json
+magnitude_probe_debug.json
+refresh_token.txt
+
+# Database SQLite dei campioni a 15 minuti (raw_storage.py) - dati reali
+# dell'utente, mai committarlo. Creato di norma dentro la cartella di
+# configurazione di Home Assistant, non qui, ma per sicurezza se qualcuno
+# lo lancia da questa cartella durante un test manuale.
+edistribuzione_curve.db
+edistribuzione_curve.db-*

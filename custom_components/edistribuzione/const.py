@@ -92,6 +92,14 @@ DEFAULT_UPDATE_INTERVAL_MINUTES = 60
 # rende comunque robusto anche se il ritardo vero fosse maggiore.
 RITARDO_DATI_GIORNI = 1
 
+# E-Distribuzione può rettificare dati già pubblicati (osservato: un giorno
+# arriva con un valore, giorni dopo torna corretto). Senza un ricontrollo
+# periodico quella correzione non verrebbe mai vista. Ogni ciclo automatico
+# richiede quindi sempre gli ultimi GIORNI_RICONTROLLO giorni (non solo il
+# giorno atteso), in un'unica richiesta per direzione - non una per giorno,
+# l'endpoint accetta già un intervallo multi-giorno.
+GIORNI_RICONTROLLO = 3
+
 CONF_DATA_INSTALLAZIONE = "data_installazione"
 CONF_GIORNI_DA_RIPROVARE = "giorni_da_riprovare"
 CONF_ORA_RICHIESTA = "ora_richiesta"

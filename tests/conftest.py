@@ -19,8 +19,24 @@ POD_B = "IT001E10000002"
 
 
 @pytest.fixture(autouse=True)
-def auto_enable_custom_integrations(enable_custom_integrations):
-    """Applicato automaticamente a tutti i test che usano il fixture 'hass'."""
+def auto_enable_custom_integrations(request):
+    """Applicato automaticamente a tutti i test che usano il fixture 'hass' -
+    tranne quelli che richiedono anche 'recorder_mock'.
+
+    enable_custom_integrations dipende da 'hass', quindi lo forza a
+    inizializzarsi per primo. Il recorder ha invece bisogno di applicare le
+    sue patch PRIMA che 'hass' esista (vedi patch_recorder nel plugin): con
+    entrambi richiesti, 'hass' vince sempre la corsa e il recorder fallisce
+    con "assert not hass_fixture_setup". I test che usano recorder_mock in
+    questo progetto chiamano le funzioni dirette del modulo (mai
+    async_setup_component/il config flow), quindi non hanno bisogno delle
+    custom integrations abilitate: si salta pulito, invece di reinventare
+    l'ordine dei fixture.
+    """
+    if "recorder_mock" in request.fixturenames:
+        yield
+        return
+    request.getfixturevalue("enable_custom_integrations")
     yield
 
 

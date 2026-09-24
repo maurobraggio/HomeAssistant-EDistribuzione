@@ -1,6 +1,25 @@
 """Import delle curve E-Distribuzione come external statistics in Home Assistant.
 
-Schema JSON di una risposta di ApiClient.async_get_daily_load_profile:
+Pipeline (dalla richiesta raw_storage.py/coordinator.py in su):
+
+    API E-Distribuzione (96 campioni/giorno, sampleFrequency=15)
+        -> raw_storage: upsert dei campioni a 15' (source of truth, SQLite)
+        -> _aggrega_ore: bucket orari dalla serie COMPLETA già in raw_storage
+        -> external statistics HA (statistic_id orario, sum cumulativa)
+        -> Energy Dashboard
+
+Il raw a 15 minuti in raw_storage.py è la source of truth: ad ogni import si
+rilegge TUTTA la serie mai importata per quel POD/direzione (non solo il
+periodo appena scaricato) e si ricalcolano da zero bucket orari + sum
+cumulativa. Questo è ciò che rende il risultato finale deterministico e
+indipendente dall'ordine di importazione: una rettifica di un giorno vecchio
+di mesi corregge automaticamente quell'ora E tutte le sum successive, senza
+nessuna logica speciale per "quali ore sono cambiate" - si ricalcola tutto,
+è già abbastanza economico per i volumi in gioco (poche decine di migliaia
+di righe anche su 6 mesi di storico).
+
+Schema JSON di una risposta di ApiClient.async_get_daily_load_profile (vedi
+raw_storage.estrai_campioni per il parsing):
 
     [
       {
@@ -40,7 +59,9 @@ La direzione la decide chi chiama async_import_curva_giornaliera (quale
 magnitude ha chiesto all'API), non questo modulo: qui non si interpreta
 'energyType' per instradare i dati, solo per fidarsi di chi ci passa i dati
 già separati per direzione - così l'aggregazione resta identica in entrambi i
-casi e più facile da testare.
+casi e più facile da testare. La stessa stringa (MAGNITUDE_PRELEVATA/
+MAGNITUDE_IMMESSA, cioè "A1"/"A2") è anche la chiave 'direzione' usata in
+raw_storage, per non dover mantenere due vocabolari paralleli.
 
 Le due direzioni NON vanno confuse con il RUOLO del POD scelto dall'utente
 (contatore di scambio o di produzione): la direzione dice cosa ha misurato
@@ -53,19 +74,19 @@ from __future__ import annotations
 import logging
 import re
 from collections import defaultdict
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 
 from homeassistant.components.recorder import get_instance
 from homeassistant.components.recorder.models import StatisticMeanType
 from homeassistant.components.recorder.statistics import (
     async_add_external_statistics,
     get_last_statistics,
-    statistics_during_period,
 )
 from homeassistant.core import HomeAssistant
 from homeassistant.util import dt as dt_util
 
-from .const import DOMAIN
+from . import raw_storage
+from .const import DOMAIN, MAGNITUDE_IMMESSA, MAGNITUDE_PRELEVATA
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -84,88 +105,22 @@ def statistic_ids(pod: str) -> tuple[str, str]:
     return _sanitize_statistic_id(pod), _sanitize_statistic_id(pod, immessa=True)
 
 
-def _aggrega_per_ora(giorni: list[dict]) -> list[tuple[datetime, float]]:
-    """Aggrega i campioni a 15 minuti di uno o più giorni in bucket orari.
+def _aggrega_ore(campioni: list[tuple[datetime, float]]) -> list[tuple[datetime, float]]:
+    """Bucket orari da campioni a 15 minuti GIA' estratti (vedi
+    raw_storage.estrai_campioni) - pura somma per ora, nessun parsing qui.
 
-    Riceve la lista grezza restituita da ApiClient.async_get_daily_load_profile
-    (un dict per giorno richiesto, tutti della stessa direzione: vedi il
-    docstring del modulo per lo schema atteso e come si calcola il timestamp
-    di ogni campione).
-
-    Righe con campi mancanti o non parsabili vengono scartate con un warning
-    invece di far fallire l'intero import: un singolo campione corrotto non
-    deve perdere il resto della giornata.
+    Riceve la serie COMPLETA di un POD/direzione (tutto ciò che c'è in
+    raw_storage, non solo l'ultimo import): è così che una rettifica su un
+    singolo campione di mesi fa ricalcola correttamente quell'ora specifica,
+    senza dover sapere in anticipo quali ore sono "cambiate".
 
     Restituisce una lista di (inizio_ora_utc_aware, kwh_totali) ordinata.
     """
     bucket: dict[datetime, float] = defaultdict(float)
-
-    for giorno in giorni:
-        readings = giorno.get("readings", {})
-        sample_values = readings.get("sampleValues", [])
-        frequenza_minuti = giorno.get("sampleFrequency")
-        initial_sample = giorno.get("initialSample")
-
-        if not sample_values or not frequenza_minuti or not initial_sample:
-            _LOGGER.debug(
-                "Giorno senza dati utilizzabili (sampleValues/sampleFrequency/"
-                "initialSample mancanti o vuoti): %r",
-                {
-                    "sampleValues": bool(sample_values),
-                    "sampleFrequency": frequenza_minuti,
-                    "initialSample": initial_sample,
-                },
-            )
-            continue
-
-        try:
-            inizio_campione_1 = datetime.fromisoformat(initial_sample)
-        except ValueError:
-            _LOGGER.warning(
-                "initialSample non parsabile come data ISO, giorno saltato: %r",
-                initial_sample,
-            )
-            continue
-
-        for campione in sample_values:
-            try:
-                indice = int(campione["id"])
-                valore_kwh = float(campione["val"])
-            except (KeyError, TypeError, ValueError):
-                _LOGGER.warning("Campione con id/val non validi, saltato: %r", campione)
-                continue
-
-            ts_utc = dt_util.as_utc(
-                inizio_campione_1 + timedelta(minutes=(indice - 1) * frequenza_minuti)
-            )
-            inizio_ora = ts_utc.replace(minute=0, second=0, microsecond=0)
-            bucket[inizio_ora] += valore_kwh
-
+    for ts, kwh in campioni:
+        inizio_ora = ts.replace(minute=0, second=0, microsecond=0)
+        bucket[inizio_ora] += kwh
     return sorted(bucket.items())
-
-
-async def _leggi_serie_esistente(hass: HomeAssistant, statistic_id: str) -> dict:
-    """Rilegge tutta la serie oraria già presente per uno statistic_id,
-    {inizio_ora_utc: kwh_dell_ora}."""
-    inizio_epoca = dt_util.utc_from_timestamp(0)
-    esistenti = await get_instance(hass).async_add_executor_job(
-        statistics_during_period,
-        hass,
-        inizio_epoca,
-        None,
-        {statistic_id},
-        "hour",
-        None,
-        {"state"},
-    )
-
-    serie: dict = {}
-    for riga in esistenti.get(statistic_id, []):
-        stato = riga.get("state")
-        if stato is None:
-            continue
-        serie[dt_util.utc_from_timestamp(riga["start"])] = float(stato)
-    return serie
 
 
 async def async_import_curva_giornaliera(
@@ -176,17 +131,20 @@ async def async_import_curva_giornaliera(
     immessa: bool = False,
     nome: str | None = None,
 ) -> date | None:
-    """Importa i campioni a 15 minuti di una direzione come external
-    statistics, aggregandoli in bucket orari.
+    """Importa i campioni a 15 minuti di una direzione: upsert nella source
+    of truth (raw_storage), poi ricalcolo completo dei bucket orari + sum
+    cumulativa da TUTTA la serie mai importata per questo POD/direzione, e
+    scrittura come external statistics.
 
-    'immessa' sceglie la serie di destinazione (vedi _sanitize_statistic_id);
-    'nome' è l'etichetta mostrata nella Energy Dashboard, che dipende dal
-    ruolo assegnato al POD e arriva quindi dal chiamante.
+    'immessa' sceglie la serie di destinazione (vedi _sanitize_statistic_id)
+    e la chiave 'direzione' in raw_storage; 'nome' è l'etichetta mostrata
+    nella Energy Dashboard, che dipende dal ruolo assegnato al POD e arriva
+    quindi dal chiamante.
 
-    Rilegge la serie esistente, la fonde con i nuovi dati (quelli nuovi hanno
-    la precedenza in caso di sovrapposizione) e ricalcola tutte le somme
-    progressive da zero, così l'ordine di importazione (storico prima o dopo
-    i dati recenti) non influisce sul risultato finale.
+    L'operazione è idempotente: ri-important dati identici produce upsert
+    che non cambiano nulla, e il ricalcolo completo della sum non dipende
+    dall'ordine di arrivo (storico prima o dopo i dati recenti, retry,
+    rettifiche).
 
     Restituisce la data locale dell'ultimo punto della serie risultante, o
     None se non c'è nulla da importare.
@@ -195,10 +153,10 @@ async def async_import_curva_giornaliera(
         _LOGGER.debug("Nessun dato curva da importare per POD %s (immessa=%s)", pod, immessa)
         return None
 
-    statistic_id = _sanitize_statistic_id(pod, immessa=immessa)
-    nuove_ore = dict(_aggrega_per_ora(dati_grezzi))
+    direzione = MAGNITUDE_IMMESSA if immessa else MAGNITUDE_PRELEVATA
+    nuovi_campioni = raw_storage.estrai_campioni(dati_grezzi)
 
-    if not nuove_ore:
+    if not nuovi_campioni:
         _LOGGER.warning(
             "POD %s (immessa=%s): nessun campione valido trovato nella "
             "risposta (schema cambiato?). Risposta grezza: %r",
@@ -208,25 +166,37 @@ async def async_import_curva_giornaliera(
         )
         return None
 
-    _LOGGER.debug(
-        "POD %s (immessa=%s): %d campioni a 15 minuti aggregati in %d ore (%s -> %s)",
-        pod,
-        immessa,
-        sum(len(g.get("readings", {}).get("sampleValues", [])) for g in dati_grezzi),
-        len(nuove_ore),
-        min(nuove_ore).isoformat(),
-        max(nuove_ore).isoformat(),
+    db_path = raw_storage.percorso_predefinito(hass)
+    await hass.async_add_executor_job(
+        raw_storage.upsert_campioni, db_path, pod, direzione, nuovi_campioni
     )
 
-    serie = await _leggi_serie_esistente(hass, statistic_id)
-    ore_gia_presenti = len(serie)
-    serie.update(nuove_ore)
+    _LOGGER.debug(
+        "POD %s (immessa=%s): %d campioni a 15 minuti aggiornati in raw_storage (%s -> %s)",
+        pod,
+        immessa,
+        len(nuovi_campioni),
+        min(ts for ts, _ in nuovi_campioni).isoformat(),
+        max(ts for ts, _ in nuovi_campioni).isoformat(),
+    )
 
+    tutti_campioni = await hass.async_add_executor_job(
+        raw_storage.leggi_campioni, db_path, pod, direzione
+    )
+    ore = _aggrega_ore(tutti_campioni)
+
+    if not ore:
+        # Non dovrebbe succedere (abbiamo appena upsertato dei campioni),
+        # ma non fidarsi mai di una lista non vuota che diventa vuota altrove.
+        _LOGGER.warning("POD %s (immessa=%s): raw_storage vuoto dopo l'upsert", pod, immessa)
+        return None
+
+    statistic_id = _sanitize_statistic_id(pod, immessa=immessa)
     running_sum = 0.0
     stats = []
-    for inizio_ora in sorted(serie):
-        running_sum += serie[inizio_ora]
-        stats.append({"start": inizio_ora, "state": serie[inizio_ora], "sum": running_sum})
+    for inizio_ora, kwh in ore:
+        running_sum += kwh
+        stats.append({"start": inizio_ora, "state": kwh, "sum": running_sum})
 
     metadata = {
         "has_mean": False,
@@ -244,20 +214,27 @@ async def async_import_curva_giornaliera(
     async_add_external_statistics(hass, metadata, stats)
     ultima_data = dt_util.as_local(stats[-1]["start"]).date()
     _LOGGER.info(
-        "POD %s (%s): %d ore nuove/aggiornate, serie riscritta con %d ore totali "
-        "(erano %d), ultimo punto %s",
+        "POD %s (%s): serie ricalcolata da raw_storage, %d ore totali, ultimo punto %s",
         pod,
         statistic_id,
-        len(nuove_ore),
         len(stats),
-        ore_gia_presenti,
         ultima_data.isoformat(),
     )
     return ultima_data
 
 
 async def _ultima_data_serie(hass: HomeAssistant, statistic_id: str) -> date | None:
-    """Ultima data (locale) presente in una singola serie, o None se vuota."""
+    """Ultima data (locale) presente in una singola serie, o None se vuota.
+
+    Interroga il Recorder (non raw_storage): questo è un controllo di
+    presenza/freschezza della external statistic VISIBILE nella Energy
+    Dashboard, usato dal coordinator per decidere se bootstrap-are un POD
+    nuovo - non la ricostruzione della serie (quella usa sempre raw_storage,
+    vedi async_import_curva_giornaliera). Se il Recorder perde i suoi dati
+    (es. corruzione del DB), è corretto che questo torni None: vogliamo che
+    il coordinator si comporti come un POD nuovo e ripopoli la Energy
+    Dashboard, non che pensi erroneamente di essere già aggiornato.
+    """
     last_stats = await get_instance(hass).async_add_executor_job(
         get_last_statistics, hass, 1, statistic_id, True, {"sum"}
     )
