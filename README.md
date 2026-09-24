@@ -13,17 +13,24 @@ fotovoltaico/produzione): influenza solo i nomi mostrati, non quali dati
 vengono scaricati - entrambe le direzioni si acquisiscono sempre, per ogni
 POD, a prescindere dal ruolo.
 
-> [!NOTE]
-> **Validato su un account reale (23/09/2026).** `MAGNITUDE_IMMESSA = "A2"`
-> è confermato: `recupera_storico` su agosto 2026 ha restituito 626.551 kWh
-> di immessa e 0.437 kWh di prelevata sul POD di produzione, esattamente i
-> valori noti per quel mese. Se il tuo account restituisse numeri
-> incoerenti, `scripts/verify_login.py` sonda anche altri candidati.
-
 ## Installazione
+
+### Tramite HACS (consigliato)
+
+Non è nello store predefinito di HACS: va aggiunto come repository custom.
+
+1. HACS → menu (⋮ in alto a destra) → **Repository personalizzati**
+2. URL: `https://github.com/maurobraggio/HomeAssistant-EDistribuzione`,
+   categoria **Integrazione**
+3. Cerca "**E-Distribuzione**" in HACS → **Scarica**
+4. Riavvia Home Assistant
+
+### Manuale (alternativa)
 
 Copia `custom_components/edistribuzione/` nella cartella
 `custom_components/` della tua istanza Home Assistant, poi riavvia.
+
+### Configurazione
 
 *Impostazioni → Dispositivi e servizi → Aggiungi integrazione → E-Distribuzione.*
 
@@ -53,6 +60,34 @@ Autoconsumo e consumo totale casa sono calcolati automaticamente da Home
 Assistant a partire da produzione + immissione + prelievo - non servono
 sensori aggiuntivi.
 
+## Architettura: 15 minuti come source of truth
+
+I campioni a 15 minuti restituiti da E-Distribuzione (96/giorno) non vengono
+aggregati e scartati: finiscono per primi in un database SQLite proprio
+dell'integrazione (`edistribuzione_curve.db`, nella cartella di
+configurazione di Home Assistant - un file indipendente, mai lo stesso
+database del Recorder). Solo dopo, dai campioni realmente memorizzati, si
+ricalcolano i bucket orari e la somma cumulativa che vanno nella Energy
+Dashboard:
+
+```
+API E-Distribuzione (15')  ->  raw storage (upsert)  ->  bucket orari + sum  ->  Energy Dashboard
+```
+
+Questo rende ogni import **idempotente e capace di autocorreggersi**: se
+E-Distribuzione rettifica in un secondo momento un campione già scaricato
+(succede), un nuovo `recupera_storico` sullo stesso periodo sovrascrive
+quel campione (stesso POD, stessa direzione, stesso istante) invece di
+duplicarlo, e ricalcola da zero sia l'ora toccata sia tutte le somme
+cumulative successive - il risultato finale non dipende dall'ordine in cui
+storico, retry e rettifiche sono arrivati.
+
+Per le stesse ragioni, il ciclo automatico giornaliero non richiede più solo
+il giorno precedente: ricontrolla sempre gli ultimi `GIORNI_RICONTROLLO`
+giorni (3 di default, in una sola richiesta per direzione, non una per
+giorno), così una rettifica recente viene vista da sola senza dover lanciare
+`recupera_storico` a mano.
+
 ## Recupero storico
 
 Azione `edistribuzione.recupera_storico(device_id, data_da, data_a)`: una
@@ -60,6 +95,9 @@ sola richiesta per direzione per l'intero periodo (confermato funzionante
 fino a 181 giorni in un'unica risposta). Scegliendo il dispositivo di un
 singolo POD il recupero si limita a quello; scegliendo il dispositivo
 "E-Distribuzione" (account) copre tutti i POD configurati.
+
+Rilanciarlo sullo stesso periodo è sempre sicuro: aggiorna/corregge invece
+di duplicare (vedi sopra).
 
 ## Verificare il protocollo prima di fidarsi dei dati
 
@@ -87,7 +125,7 @@ python3 -m venv .venv
 
 Il protocollo (login OAuth2+PKCE+OTP via Salesforce, client REST MuleSoft
 per i dati) è stato reverse-engineered per l'integrazione multi-distributore
-[HomeAssistant-Contatore](https://github.com/maurobraggio/HomeAssistant-Contatore),
+[HomeAssistant-Contatore](https://github.com/riccardorossi92/HomeAssistant-Contatore),
 che resta la scelta giusta per chi ha anche Duereti, Unareti o Areti. Questo
 repository è dedicato solo a E-Distribuzione, con supporto nativo per
 prelevata/immessa separate e un ruolo configurabile per POD.
