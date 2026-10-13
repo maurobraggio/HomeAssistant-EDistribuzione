@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 from typing import Any
+from urllib.parse import urlencode
 
 import voluptuous as vol
 from homeassistant import config_entries
@@ -23,8 +24,19 @@ from homeassistant.helpers.aiohttp_client import (
 )
 
 from .api import ApiClient
-from .auth import AuthClient, InvalidCredentials, InvalidOtp, ParsingError, TroppeSessioni
+from .auth import (
+    AuthClient,
+    BloccoAntibot,
+    InvalidBrowserRedirect,
+    InvalidCredentials,
+    InvalidOtp,
+    ParsingError,
+    TroppeSessioni,
+)
+from .browser_oauth import OAUTH_BROWSER_EXCHANGE_PATH, register_browser_oauth_view
 from .const import (
+    CONF_ACCESS_TOKEN,
+    CONF_INSTANCE_URL,
     CONF_ORA_RICHIESTA,
     CONF_PODS,
     CONF_REFRESH_TOKEN,
@@ -84,8 +96,11 @@ class EdistribuzioneConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     def __init__(self) -> None:
         self._session = None
         self._auth: AuthClient | None = None
+        self._email: str | None = None
         self._access_token: str | None = None
         self._refresh_token: str | None = None
+        self._browser_auth_url: str | None = None
+        self._browser_exchange_url: str | None = None
         self._pods_disponibili: list[dict] = []
         self._reauth_entry: config_entries.ConfigEntry | None = None
 
@@ -143,9 +158,20 @@ class EdistribuzioneConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         return AVVISO_OTP_SOLO_DA_QUI
 
     async def async_step_user(self, user_input: dict[str, Any] | None = None):
+        """Propone subito il browser; il login headless resta un'alternativa."""
+        return self.async_show_menu(
+            step_id="user",
+            menu_options=["browser_login", "password_login"],
+        )
+
+    async def async_step_password_login(
+        self, user_input: dict[str, Any] | None = None
+    ):
+        """Vecchio percorso email/password + OTP eseguito dal container."""
         errors: dict[str, str] = {}
 
         if user_input is not None:
+            self._email = user_input["email"]
             # Sessione dedicata (non quella condivisa di Home Assistant):
             # questo login passa per una catena di redirect Salesforce che
             # dipende da un cookie di sessione impostato a metà strada, che
@@ -168,6 +194,8 @@ class EdistribuzioneConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 # successivo a chiederlo.
                 _LOGGER.warning("Login rifiutato: troppe sessioni aperte sull'account")
                 errors["base"] = "troppe_sessioni"
+            except BloccoAntibot:
+                return await self.async_step_antibot()
             except ParsingError:
                 _LOGGER.exception("Parsing della pagina di login fallito")
                 errors["base"] = "cannot_connect"
@@ -181,12 +209,117 @@ class EdistribuzioneConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             else:
                 return await self.async_step_otp()
 
+        email = (
+            vol.Required("email", default=self._email)
+            if self._email
+            else vol.Required("email")
+        )
         return self.async_show_form(
-            step_id="user",
-            data_schema=vol.Schema({vol.Required("email"): str, vol.Required("password"): str}),
+            step_id="password_login",
+            data_schema=vol.Schema({email: str, vol.Required("password"): str}),
             errors=errors,
             description_placeholders={"pod_correnti": self._nota_reauth()},
         )
+
+    async def async_step_antibot(self, user_input: dict[str, Any] | None = None):
+        """Spiega il blocco Imperva senza farlo sembrare un errore password.
+
+        Un menu, invece del form credenziali con un errore rosso, evita che
+        l'utente ripeta subito il login peggiorando il rate/risk score. Il
+        pulsante riporta al login quando ha atteso o cambiato rete.
+        """
+        return self.async_show_menu(
+            step_id="antibot",
+            menu_options=["browser_login", "riprova_login"],
+        )
+
+    async def async_step_browser_login(self, user_input: dict[str, Any] | None = None):
+        """Completa OAuth nel browser reale, fuori dal blocco anti-bot.
+
+        Il link contiene soltanto challenge PKCE e state. Home Assistant
+        conserva il verifier in memoria e riceve dall'utente il redirect
+        finale ``eneldist://`` con un authorization code monouso.
+        """
+        if self._session is None:
+            self._session = async_create_clientsession(self.hass)
+        if self._auth is None:
+            self._auth = AuthClient(self._session)
+        if self._browser_auth_url is None:
+            self._browser_auth_url = (
+                self._auth.prepare_browser_token_authorization_url()
+            )
+        register_browser_oauth_view(self.hass)
+
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            try:
+                tokens = self._auth.tokens_from_browser_redirect(
+                    user_input["redirect_url"]
+                )
+            except InvalidBrowserRedirect:
+                # Compatibilità con un flow iniziato dalla versione 0.2.3:
+                # quel link contiene un authorization code PKCE e richiede
+                # ancora il vecchio scambio tramite pagina locale.
+                try:
+                    exchange = self._auth.prepare_browser_token_exchange(
+                        user_input["redirect_url"]
+                    )
+                except InvalidBrowserRedirect:
+                    errors["base"] = "invalid_browser_redirect"
+                else:
+                    fragment = urlencode({
+                        "code": exchange.code,
+                        "code_verifier": exchange.code_verifier,
+                    })
+                    self._browser_exchange_url = self._url_scambio_browser(fragment)
+                    return await self.async_step_browser_token_exchange()
+            else:
+                return await self._autenticazione_completata(tokens)
+
+        return self.async_show_form(
+            step_id="browser_login",
+            data_schema=vol.Schema({vol.Required("redirect_url"): str}),
+            errors=errors,
+            description_placeholders={
+                "authorization_url": self._browser_auth_url,
+                "pod_correnti": self._nota_reauth(),
+            },
+        )
+
+    async def async_step_browser_token_exchange(
+        self, user_input: dict[str, Any] | None = None
+    ):
+        """Riceve la risposta OAuth creata dal token endpoint nel browser."""
+        if self._browser_exchange_url is None or self._auth is None:
+            return self.async_abort(reason="browser_exchange_missing")
+
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            try:
+                tokens = self._auth.tokens_from_browser_payload(
+                    user_input["oauth_response"]
+                )
+            except InvalidBrowserRedirect:
+                errors["base"] = "invalid_browser_token"
+            else:
+                return await self._autenticazione_completata(tokens)
+
+        return self.async_show_form(
+            step_id="browser_token_exchange",
+            data_schema=vol.Schema({
+                vol.Required("oauth_response"): selector.TextSelector(
+                    selector.TextSelectorConfig(multiline=True)
+                )
+            }),
+            errors=errors,
+            description_placeholders={
+                "exchange_url": self._browser_exchange_url,
+            },
+        )
+
+    async def async_step_riprova_login(self, user_input: dict[str, Any] | None = None):
+        """Torna al login conservando l'email già inserita."""
+        return await self.async_step_password_login()
 
     def _nota_reauth(self) -> str:
         """Frase aggiuntiva mostrata solo durante un reauth, per ricordare
@@ -195,6 +328,19 @@ class EdistribuzioneConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             return ""
         pods = ", ".join(self._reauth_entry.data.get(CONF_PODS, []))
         return f" Stai aggiornando le credenziali per i POD: {pods}."
+
+    def _url_scambio_browser(self, fragment: str) -> str:
+        """URL assoluto per evitare che il router frontend intercetti /api."""
+        base_url = self.hass.config.internal_url or self.hass.config.external_url
+        if not base_url:
+            api = self.hass.config.api
+            scheme = "https" if api is not None and api.use_ssl else "http"
+            port = api.port if api is not None else 8123
+            # 127.0.0.1 è intenzionalmente diverso dall'origine tipica
+            # ``localhost`` del frontend: così il router SPA non intercetta
+            # il link /api e il browser esegue davvero la richiesta HTTP.
+            base_url = f"{scheme}://127.0.0.1:{port}"
+        return f"{base_url.rstrip('/')}{OAUTH_BROWSER_EXCHANGE_PATH}#{fragment}"
 
     async def async_step_otp(self, user_input: dict[str, Any] | None = None):
         errors: dict[str, str] = {}
@@ -224,21 +370,28 @@ class EdistribuzioneConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 _LOGGER.exception("Errore imprevisto durante lo scambio del codice OTP")
                 return self.async_abort(reason="otp_exchange_failed")
             else:
-                self._access_token = tokens.access_token
-                self._refresh_token = tokens.refresh_token
-                if self._reauth_entry is not None:
-                    nuovi_dati = {
-                        **self._reauth_entry.data,
-                        CONF_REFRESH_TOKEN: tokens.refresh_token,
-                    }
-                    self.hass.config_entries.async_update_entry(
-                        self._reauth_entry, data=nuovi_dati
-                    )
-                    await self.hass.config_entries.async_reload(self._reauth_entry.entry_id)
-                    return self.async_abort(reason="reauth_successful")
-                return await self.async_step_pod()
+                return await self._autenticazione_completata(tokens)
 
         return self._form_otp(errors, avviso)
+
+    async def _autenticazione_completata(self, tokens):
+        """Prosegue allo stesso modo dopo OTP headless o login nel browser."""
+        self._access_token = tokens.access_token
+        self._refresh_token = tokens.refresh_token
+        self._instance_url = getattr(tokens, "instance_url", "")
+        if self._reauth_entry is not None:
+            nuovi_dati = {
+                **self._reauth_entry.data,
+                CONF_ACCESS_TOKEN: tokens.access_token,
+                CONF_REFRESH_TOKEN: tokens.refresh_token,
+                CONF_INSTANCE_URL: self._instance_url,
+            }
+            self.hass.config_entries.async_update_entry(
+                self._reauth_entry, data=nuovi_dati
+            )
+            await self.hass.config_entries.async_reload(self._reauth_entry.entry_id)
+            return self.async_abort(reason="reauth_successful")
+        return await self.async_step_pod()
 
     # ------------------------------------------------------------------
     # Selezione POD (solo per il setup iniziale, non per il reauth)
@@ -265,7 +418,12 @@ class EdistribuzioneConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             titolo = pods[0] if len(pods) == 1 else f"{len(pods)} POD"
             return self.async_create_entry(
                 title=titolo,
-                data={CONF_PODS: pods, CONF_REFRESH_TOKEN: self._refresh_token},
+                data={
+                    CONF_PODS: pods,
+                    CONF_ACCESS_TOKEN: self._access_token,
+                    CONF_REFRESH_TOKEN: self._refresh_token,
+                    CONF_INSTANCE_URL: self._instance_url,
+                },
             )
 
         # Con un solo POD sull'account non serve far scegliere.
@@ -299,7 +457,10 @@ class EdistribuzioneConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
     async def async_step_reauth(self, entry_data: dict[str, Any]):
         self._reauth_entry = self.hass.config_entries.async_get_entry(self.context["entry_id"])
-        return await self.async_step_user()
+        # La reauth è richiesta proprio quando il refresh automatico non è
+        # più utilizzabile. Il browser è il percorso più affidabile contro
+        # Imperva e non richiede di consegnare la password a Home Assistant.
+        return await self.async_step_browser_login()
 
     @staticmethod
     @callback
@@ -316,8 +477,19 @@ class EdistribuzioneOptionsFlow(config_entries.OptionsFlow):
     async def async_step_init(self, user_input: dict[str, Any] | None = None):
         return self.async_show_menu(
             step_id="init",
-            menu_options=["tipo_pod", "aggiungi_pod", "rimuovi_pod", "orario"],
+            menu_options=[
+                "riautentica",
+                "tipo_pod",
+                "aggiungi_pod",
+                "rimuovi_pod",
+                "orario",
+            ],
         )
+
+    async def async_step_riautentica(self, user_input: dict[str, Any] | None = None):
+        """Avvia volontariamente il reauth senza rimuovere la config entry."""
+        self.config_entry.async_start_reauth(self.hass)
+        return self.async_abort(reason="reauth_started")
 
     async def async_step_tipo_pod(self, user_input: dict[str, Any] | None = None):
         pods = list(self.config_entry.data.get(CONF_PODS, []))
@@ -387,16 +559,19 @@ class EdistribuzioneOptionsFlow(config_entries.OptionsFlow):
             return self.async_create_entry(title="", data=dict(self.config_entry.options))
 
         session = async_get_clientsession(self.hass)
-        auth = AuthClient(session)
-        try:
-            tokens = await auth.async_refresh_access_token(
-                self.config_entry.data[CONF_REFRESH_TOKEN]
-            )
-        except Exception:  # noqa: BLE001
-            _LOGGER.exception("Refresh del token fallito nelle opzioni")
-            return self.async_abort(reason="refresh_failed")
+        access_token = self.config_entry.data.get(CONF_ACCESS_TOKEN)
+        if not access_token:
+            auth = AuthClient(session)
+            try:
+                tokens = await auth.async_refresh_access_token(
+                    self.config_entry.data[CONF_REFRESH_TOKEN]
+                )
+            except Exception:  # noqa: BLE001
+                _LOGGER.exception("Refresh del token fallito nelle opzioni")
+                return self.async_abort(reason="refresh_failed")
+            access_token = tokens.access_token
 
-        api = ApiClient(session, tokens.access_token)
+        api = ApiClient(session, access_token)
         try:
             tutti_pod = await api.async_get_supplies()
         except Exception:  # noqa: BLE001

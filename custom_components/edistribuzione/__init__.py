@@ -14,9 +14,11 @@ from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers import device_registry as dr
 
+from .browser_oauth import register_browser_oauth_view
 from .const import DOMAIN
 from .coordinator import EdistribuzioneCoordinator
 from .energy_dashboard import async_configura_energy_dashboard
+from .repairs import async_delete_antibot_issue
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -30,6 +32,13 @@ SCHEMA_RECUPERA_STORICO = vol.Schema({
     vol.Required("data_a"): cv.date,
     vol.Required("device_id"): cv.string,
 })
+
+
+async def async_setup(hass: HomeAssistant, config: dict) -> bool:
+    """Registra la pagina locale usata dal fallback OAuth nel browser."""
+    del config
+    register_browser_oauth_view(hass)
+    return True
 
 
 def _risolvi_coordinator_e_pod_da_device(
@@ -110,12 +119,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     coordinator = EdistribuzioneCoordinator(hass, entry)
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
     await _async_registra_servizi(hass)
-    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
-    # async_config_entry_first_refresh SOLLEVA ConfigEntryNotReady se il
-    # primo refresh fallisce: qui va bene, dato che il refresh_token è stato
-    # appena ottenuto nel config flow e un fallimento immediato segnala
-    # verosimilmente un problema reale.
+    # Il refresh deve avvenire PRIMA di creare le piattaforme. Se fallisce e
+    # Home Assistant riprova il setup, nessun sensore è ancora registrato;
+    # inoltrando prima le piattaforme, ogni retry tentava invece di registrare
+    # la stessa config entry una seconda volta ("has already been setup").
     await coordinator.async_config_entry_first_refresh()
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     return True
 
 
@@ -126,6 +135,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         return False
 
     hass.data[DOMAIN].pop(entry.entry_id, None)
+    async_delete_antibot_issue(hass, entry.entry_id)
 
     if not hass.data[DOMAIN]:
         hass.services.async_remove(DOMAIN, SERVICE_RECUPERA_STORICO)

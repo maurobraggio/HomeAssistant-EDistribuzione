@@ -1,0 +1,65 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Sign in to E-Distribuzione",
+        "description": "Browser sign-in is recommended: it passes the anti-bot protection without giving the password to Home Assistant. Password + OTP remains available as an alternative.",
+        "menu_options": {
+          "browser_login": "Continue in browser (recommended)",
+          "password_login": "Use password and OTP"
+        }
+      },
+      "password_login": {
+        "title": "Sign in with password and OTP",
+        "description": "Use the same credentials as the official E-Distribuzione app or website. You will then be asked for the OTP sent by this configuration.{pod_correnti}",
+        "data": {
+          "email": "Email",
+          "password": "Password"
+        }
+      },
+      "antibot": {
+        "title": "Automated access was blocked",
+        "description": "E-Distribuzione blocked the login performed directly by Home Assistant. Continue in a normal browser so the anti-bot protection can verify that session.",
+        "menu_options": {
+          "browser_login": "Continue in browser (recommended)",
+          "riprova_login": "Return to login"
+        }
+      },
+      "browser_login": {
+        "title": "Authorize E-Distribuzione in your browser",
+        "description": "First sign in to the [E-Distribuzione customer portal](https://private.e-distribuzione.it/PortaleClienti/s/) in the same browser. Then open [the official authorization]({authorization_url}). A blank final page is expected. Open Chrome DevTools Console (`⌥⌘J` on macOS), find the “Failed to launch `eneldist://redirect?...`” error, right-click its `eneldist://...` link, choose “Copy link address”, paste it below, and submit. Authentication then completes directly, without a second XML exchange. Home Assistant does not store the password.{pod_correnti}",
+        "data": {
+          "redirect_url": "Final eneldist://redirect URL"
+        }
+      },
+      "browser_token_exchange": {
+        "title": "Complete the OAuth exchange in your browser",
+        "description": "Open [the local token exchange page]({exchange_url}). The browser will submit the OAuth form to E-Distribuzione and show an XML page. Select and copy the whole page, then paste it below. Do not share this private token response.",
+        "data": {
+          "oauth_response": "OAuth XML response returned by the browser"
+        }
+      }
+    },
+    "error": {
+      "invalid_browser_redirect": "The final URL is invalid, incomplete, or belongs to another attempt.",
+      "invalid_browser_token": "The OAuth response is invalid or does not contain the required tokens."
+    },
+    "abort": {
+      "browser_exchange_missing": "The OAuth exchange session is no longer available. Restart reauthentication."
+    }
+  },
+  "issues": {
+    "antibot_refresh_blocked": {
+      "title": "Access to E-Distribuzione is temporarily blocked",
+      "description": "E-Distribuzione's anti-bot protection is preventing automatic access renewal for **{entry_title}**. Data will not be updated until the block ends.\n\nThis does not necessarily mean that the password is wrong. Avoid repeated attempts, sign out of the official E-Distribuzione app and website, wait a few hours, and retry without a VPN or proxy. This issue will disappear automatically when renewal works again.",
+      "fix_flow": {
+        "step": {
+          "init": {
+            "title": "Reauthenticate E-Distribuzione",
+            "description": "Start a new authentication for **{entry_title}**. If the anti-bot page appears again, stop trying and retry after a few hours. Select **Submit** to continue."
+          }
+        }
+      }
+    }
+  }
+}

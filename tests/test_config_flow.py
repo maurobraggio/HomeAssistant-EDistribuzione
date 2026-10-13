@@ -18,12 +18,15 @@ from custom_components.edistribuzione import api as edist_api
 from custom_components.edistribuzione import auth as edist_auth
 from custom_components.edistribuzione import config_flow as cf
 from custom_components.edistribuzione.auth import (
+    BloccoAntibot,
     InvalidCredentials,
     InvalidOtp,
     ParsingError,
     TroppeSessioni,
 )
 from custom_components.edistribuzione.const import (
+    CONF_ACCESS_TOKEN,
+    CONF_INSTANCE_URL,
     CONF_ORA_RICHIESTA,
     CONF_PODS,
     CONF_REFRESH_TOKEN,
@@ -49,10 +52,34 @@ def edist_mocks(monkeypatch):
     login e OTP ok, un solo POD sull'account."""
     auth = Mock()
     auth.async_begin_login = AsyncMock(return_value=None)
+    auth.prepare_browser_token_authorization_url = Mock(
+        return_value="https://private.e-distribuzione.it/oauth-browser"
+    )
+    auth.tokens_from_browser_redirect = Mock(
+        return_value=SimpleNamespace(
+            access_token="acc-browser",
+            refresh_token="ref-browser",
+            instance_url="https://example.my.site.com/PortaleClienti",
+        )
+    )
+    auth.prepare_browser_token_exchange = Mock(
+        return_value=SimpleNamespace(code="code-browser", code_verifier="verifier-browser")
+    )
+    auth.tokens_from_browser_payload = Mock(
+        return_value=SimpleNamespace(
+            access_token="acc-browser",
+            refresh_token="ref-browser",
+            instance_url="https://example.my.site.com/PortaleClienti",
+        )
+    )
     auth.otp_invio_confermato = True
     auth.async_resend_otp = AsyncMock(return_value=True)
     auth.async_submit_otp = AsyncMock(
-        return_value=SimpleNamespace(access_token="acc", refresh_token="ref-nuovo")
+        return_value=SimpleNamespace(
+            access_token="acc",
+            refresh_token="ref-nuovo",
+            instance_url="https://example.my.site.com/PortaleClienti",
+        )
     )
     auth.async_refresh_access_token = AsyncMock(
         return_value=SimpleNamespace(access_token="acc2", refresh_token="ref-nuovo")
@@ -66,11 +93,17 @@ def edist_mocks(monkeypatch):
     monkeypatch.setattr(cf, "ApiClient", Mock(return_value=api))
     monkeypatch.setattr(cf, "async_create_clientsession", lambda *a, **k: Mock())
     monkeypatch.setattr(cf, "async_get_clientsession", lambda *a, **k: Mock())
+    monkeypatch.setattr(cf, "register_browser_oauth_view", lambda hass: None)
     return SimpleNamespace(auth=auth, api=api)
 
 
 async def _fino_a_user(hass):
-    return await hass.config_entries.flow.async_init(DOMAIN, context={"source": "user"})
+    res = await hass.config_entries.flow.async_init(DOMAIN, context={"source": "user"})
+    assert res["step_id"] == "user"
+    assert res["menu_options"] == ["browser_login", "password_login"]
+    return await hass.config_entries.flow.async_configure(
+        res["flow_id"], {"next_step_id": "password_login"}
+    )
 
 
 # --- login -> OTP -----------------------------------------------------------
@@ -83,7 +116,7 @@ async def test_credenziali_non_valide(hass, edist_mocks):
         res["flow_id"], {"email": "a@b.it", "password": "x"}
     )
     assert res["type"] == FlowResultType.FORM
-    assert res["step_id"] == "user"
+    assert res["step_id"] == "password_login"
     assert res["errors"] == {"base": "invalid_auth"}
 
 
@@ -94,6 +127,78 @@ async def test_pagina_login_cambiata(hass, edist_mocks):
         res["flow_id"], {"email": "a@b.it", "password": "x"}
     )
     assert res["errors"] == {"base": "cannot_connect"}
+
+
+async def test_bloccato_dalla_protezione_antibot(hass, edist_mocks):
+    """Il blocco Imperva porta a istruzioni dedicate, non a un errore password."""
+    edist_mocks.auth.async_begin_login.side_effect = BloccoAntibot(
+        "Pardon Our Interruption"
+    )
+    res = await _fino_a_user(hass)
+    res = await hass.config_entries.flow.async_configure(
+        res["flow_id"], {"email": "a@b.it", "password": "x"}
+    )
+    assert res["type"] == FlowResultType.MENU
+    assert res["step_id"] == "antibot"
+    assert res["menu_options"] == ["browser_login", "riprova_login"]
+
+    res = await hass.config_entries.flow.async_configure(
+        res["flow_id"], {"next_step_id": "riprova_login"}
+    )
+    assert res["type"] == FlowResultType.FORM
+    assert res["step_id"] == "password_login"
+    # L'email non va riscritta dopo avere atteso: resta proposta nel form.
+    assert res["data_schema"]({"password": "nuova"})["email"] == "a@b.it"
+
+
+async def test_blocco_antibot_prosegue_con_oauth_nel_browser(hass, edist_mocks):
+    edist_mocks.auth.async_begin_login.side_effect = BloccoAntibot(
+        "Pardon Our Interruption"
+    )
+    res = await _fino_a_user(hass)
+    res = await hass.config_entries.flow.async_configure(
+        res["flow_id"], {"email": "a@b.it", "password": "x"}
+    )
+    res = await hass.config_entries.flow.async_configure(
+        res["flow_id"], {"next_step_id": "browser_login"}
+    )
+
+    assert res["type"] == FlowResultType.FORM
+    assert res["step_id"] == "browser_login"
+    assert "oauth-browser" in res["description_placeholders"]["authorization_url"]
+    edist_mocks.auth.prepare_browser_token_authorization_url.assert_called_once_with()
+
+    res = await hass.config_entries.flow.async_configure(
+        res["flow_id"],
+        {"redirect_url": "eneldist://redirect#access_token=acc&state=ok"},
+    )
+    assert res["type"] == FlowResultType.CREATE_ENTRY
+    assert res["data"][CONF_REFRESH_TOKEN] == "ref-browser"
+    assert res["data"][CONF_ACCESS_TOKEN] == "acc-browser"
+    assert res["data"][CONF_INSTANCE_URL] == "https://example.my.site.com/PortaleClienti"
+
+
+async def test_browser_login_rifiuta_redirect_non_valido(hass, edist_mocks):
+    edist_mocks.auth.async_begin_login.side_effect = BloccoAntibot("blocked")
+    edist_mocks.auth.tokens_from_browser_redirect.side_effect = (
+        edist_auth.InvalidBrowserRedirect("state errato")
+    )
+    edist_mocks.auth.prepare_browser_token_exchange.side_effect = (
+        edist_auth.InvalidBrowserRedirect("state errato")
+    )
+    res = await _fino_a_user(hass)
+    res = await hass.config_entries.flow.async_configure(
+        res["flow_id"], {"email": "a@b.it", "password": "x"}
+    )
+    res = await hass.config_entries.flow.async_configure(
+        res["flow_id"], {"next_step_id": "browser_login"}
+    )
+    res = await hass.config_entries.flow.async_configure(
+        res["flow_id"], {"redirect_url": "eneldist://redirect?code=vecchio"}
+    )
+
+    assert res["step_id"] == "browser_login"
+    assert res["errors"] == {"base": "invalid_browser_redirect"}
 
 
 async def test_troppe_sessioni_al_login(hass, edist_mocks):
@@ -109,7 +214,7 @@ async def test_troppe_sessioni_al_login(hass, edist_mocks):
         res["flow_id"], {"email": "a@b.it", "password": "x"}
     )
     assert res["type"] == FlowResultType.FORM
-    assert res["step_id"] == "user"
+    assert res["step_id"] == "password_login"
     assert res["errors"] == {"base": "troppe_sessioni"}
 
 
@@ -188,6 +293,7 @@ async def test_un_solo_pod_crea_entry_subito(hass, edist_mocks):
     assert res["type"] == FlowResultType.CREATE_ENTRY
     assert res["data"][CONF_PODS] == ["IT001E00000009"]
     assert res["data"][CONF_REFRESH_TOKEN] == "ref-nuovo"
+    assert res["data"][CONF_ACCESS_TOKEN] == "acc"
 
 
 async def test_nessun_pod_sull_account_abortisce(hass, edist_mocks):
@@ -249,14 +355,16 @@ async def test_reauth_aggiorna_refresh_token(hass, edist_mocks):
     res = await hass.config_entries.flow.async_init(
         DOMAIN, context={"source": "reauth", "entry_id": entry.entry_id}, data=entry.data
     )
-    assert res["step_id"] == "user"
+    assert res["step_id"] == "browser_login"
     res = await hass.config_entries.flow.async_configure(
-        res["flow_id"], {"email": "a@b.it", "password": "x"}
+        res["flow_id"],
+        {"redirect_url": "eneldist://redirect#access_token=acc&state=ok"},
     )
-    res = await hass.config_entries.flow.async_configure(res["flow_id"], {"otp": "123456"})
     assert res["type"] == FlowResultType.ABORT
     assert res["reason"] == "reauth_successful"
-    assert entry.data[CONF_REFRESH_TOKEN] == "ref-nuovo"
+    assert entry.data[CONF_REFRESH_TOKEN] == "ref-browser"
+    assert entry.data[CONF_ACCESS_TOKEN] == "acc-browser"
+    assert entry.data[CONF_INSTANCE_URL] == "https://example.my.site.com/PortaleClienti"
 
 
 # --- options flow ------------------------------------------------------------
@@ -266,7 +374,26 @@ async def test_opzioni_menu(hass):
     entry = _entry_edist(hass)
     res = await hass.config_entries.options.async_init(entry.entry_id)
     assert res["type"] == FlowResultType.MENU
-    assert set(res["menu_options"]) == {"tipo_pod", "aggiungi_pod", "rimuovi_pod", "orario"}
+    assert set(res["menu_options"]) == {
+        "riautentica",
+        "tipo_pod",
+        "aggiungi_pod",
+        "rimuovi_pod",
+        "orario",
+    }
+
+
+async def test_opzioni_riautentica_senza_rimuovere_entry(hass):
+    entry = _entry_edist(hass)
+    with patch.object(entry, "async_start_reauth") as start_reauth:
+        res = await hass.config_entries.options.async_init(entry.entry_id)
+        res = await hass.config_entries.options.async_configure(
+            res["flow_id"], {"next_step_id": "riautentica"}
+        )
+
+    start_reauth.assert_called_once_with(hass)
+    assert res["type"] == FlowResultType.ABORT
+    assert res["reason"] == "reauth_started"
 
 
 async def test_opzioni_orario_salva_valore(hass):

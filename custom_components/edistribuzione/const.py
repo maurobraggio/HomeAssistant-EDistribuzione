@@ -13,10 +13,13 @@ SF_BASE = "https://private.e-distribuzione.it/PortaleClienti"
 OAUTH_AUTHORIZE_URL = f"{SF_BASE}/services/oauth2/authorize"
 OAUTH_TOKEN_URL = f"{SF_BASE}/services/oauth2/token"
 OAUTH_USERINFO_URL = f"{SF_BASE}/services/oauth2/userinfo"
+OAUTH_SINGLEACCESS_URL = f"{SF_BASE}/services/oauth2/singleaccess"
 
 LOGIN_PAGE_URL = f"{SF_BASE}/s/login/"
 AURA_ENDPOINT = f"{SF_BASE}/s/sfsites/aura"
 LOGINFLOW_URL = f"{SF_BASE}/loginflow/loginFlow.apexp"
+PORTAL_CURVE_PATH = "/PortaleClienti/s/curvedicarico"
+PORTAL_CURVE_URL = f"https://private.e-distribuzione.it{PORTAL_CURVE_PATH}"
 
 # Client ID dell'app ufficiale E-Distribuzione (pubblico, stile app nativa -
 # nessun client_secret, coerente con PKCE). Riusare il client_id di Enel è
@@ -66,7 +69,9 @@ MAGNITUDE_TUTTE = (MAGNITUDE_PRELEVATA, MAGNITUDE_IMMESSA)
 
 # --- Configurazione persistita ------------------------------------------------
 CONF_PODS = "pods"  # lista di codici POD: tutti sulla stessa utenza già autenticata
+CONF_ACCESS_TOKEN = "access_token"
 CONF_REFRESH_TOKEN = "refresh_token"
+CONF_INSTANCE_URL = "instance_url"
 
 CONF_TIPO_POD = "tipo_pod"  # {pod: "scambio"|"produzione"}, in entry.options
 TIPO_POD_SCAMBIO = "scambio"

@@ -3,6 +3,14 @@
     "step": {
       "user": {
         "title": "Accedi a E-Distribuzione",
+        "description": "L'accesso nel browser è consigliato: supera la protezione anti-bot senza consegnare la password a Home Assistant. Il metodo password + OTP resta disponibile come alternativa.",
+        "menu_options": {
+          "browser_login": "Continua nel browser (consigliato)",
+          "password_login": "Usa password e OTP"
+        }
+      },
+      "password_login": {
+        "title": "Accedi con password e OTP",
         "description": "Usa le stesse credenziali dell'app o del sito ufficiale E-Distribuzione. Dopo l'accesso ti verrà chiesto un codice OTP, ricevuto via email o SMS: sarà inviato da questa configurazione, non usare codici generati sul sito o nell'app. Se hai l'app o il sito aperti, esci prima da lì: E-Distribuzione limita il numero di sessioni contemporanee per account.{pod_correnti}",
         "data": {
           "email": "Email",
@@ -17,6 +25,28 @@
           "richiedi_nuovo_codice": "Richiedi un nuovo codice (lascia vuoto il campo sopra)"
         }
       },
+      "antibot": {
+        "title": "Accesso temporaneamente bloccato",
+        "description": "E-Distribuzione ha bloccato il login eseguito direttamente da Home Assistant. Puoi completare in sicurezza l'accesso nel tuo browser normale, dove la protezione anti-bot può verificare la sessione, oppure tornare al vecchio login e riprovare più tardi.",
+        "menu_options": {
+          "browser_login": "Continua nel browser (consigliato)",
+          "riprova_login": "Torna al login"
+        }
+      },
+      "browser_login": {
+        "title": "Autorizza E-Distribuzione nel browser",
+        "description": "1. Nello stesso browser, accedi prima al [Portale Clienti E-Distribuzione](https://private.e-distribuzione.it/PortaleClienti/s/) e lascia aperta la sessione.\n2. Apri [l'autorizzazione ufficiale E-Distribuzione]({authorization_url}): userà la sessione appena aperta, senza un nuovo login mobile.\n3. È normale che alla fine rimanga una pagina bianca. Apri **Vista > Opzioni per sviluppatori > Console JavaScript** (oppure `⌥⌘J`), cerca l'errore “Failed to launch `eneldist://redirect?...`”, fai clic destro sul collegamento `eneldist://...` e scegli **Copy link address**.\n4. Incolla qui sotto l'indirizzo copiato e premi Invia: l'autenticazione sarà completa, senza un secondo scambio XML.\n\nHome Assistant non memorizza la password.{pod_correnti}",
+        "data": {
+          "redirect_url": "URL finale eneldist://redirect"
+        }
+      },
+      "browser_token_exchange": {
+        "title": "Completa lo scambio OAuth nel browser",
+        "description": "1. Apri [la pagina locale di scambio token]({exchange_url}): il browser invierà automaticamente il form OAuth a E-Distribuzione.\n2. Comparirà una pagina XML. Seleziona tutto il contenuto della pagina e copialo.\n3. Torna qui, incolla la risposta nel campo e premi **Invia**.\n\nLa risposta contiene token riservati: non condividerla. Code e PKCE verifier viaggiano soltanto nel fragment locale del link e non vengono inviati ai server Home Assistant.",
+        "data": {
+          "oauth_response": "Risposta OAuth XML restituita dal browser"
+        }
+      },
       "pod": {
         "title": "Seleziona POD",
         "description": "Puoi selezionare più di un POD se vuoi monitorarne diversi con questa stessa configurazione.",
@@ -28,8 +58,11 @@
     "error": {
       "invalid_auth": "Email o password non valide",
       "cannot_connect": "Impossibile contattare E-Distribuzione",
+      "invalid_browser_redirect": "L'URL finale non è valido, è incompleto oppure appartiene a un altro tentativo. Usa il link mostrato sopra e incolla l'intero indirizzo che inizia con eneldist://redirect.",
+      "invalid_browser_token": "La risposta OAuth non è valida oppure non contiene access_token e refresh_token.",
       "invalid_otp": "Codice OTP errato o scaduto. Deve essere il codice inviato da questa configurazione: uno generato sul sito o nell'app appartiene a un'altra sessione di login e viene sempre rifiutato.",
       "otp_mancante": "Inserisci il codice OTP, oppure spunta \"Richiedi un nuovo codice\" per farne inviare uno nuovo",
+      "bloccato_antibot": "E-Distribuzione ha bloccato la richiesta con la sua protezione anti-bot (pagina \"Pardon Our Interruption\") prima ancora di mostrare il login. Non dipende dalle credenziali: riprova più tardi. Se il blocco persiste per giorni, apri una issue.",
       "troppe_sessioni": "E-Distribuzione ha rifiutato l'accesso perché l'account ha troppe sessioni aperte contemporaneamente. Esci dall'app ufficiale e dal sito, attendi qualche minuto e riprova: in questo stato nessun codice OTP viene inviato.",
       "nessun_pod_selezionato": "Seleziona almeno un POD"
     },
@@ -37,7 +70,8 @@
       "reauth_successful": "Credenziali aggiornate con successo",
       "no_pods_found": "Nessun POD trovato per questo account",
       "supplies_failed": "Errore imprevisto nel recupero dei POD dall'account. Riprova la configurazione da capo (login + OTP inclusi).",
-      "otp_exchange_failed": "Il codice OTP è stato accettato ma il completamento dell'accesso è fallito. Riprova la configurazione da capo (login + OTP inclusi)."
+      "otp_exchange_failed": "Il codice OTP è stato accettato ma il completamento dell'accesso è fallito. Riprova la configurazione da capo (login + OTP inclusi).",
+      "browser_exchange_missing": "La sessione di scambio OAuth non è più disponibile. Riavvia la riautenticazione."
     }
   },
   "options": {
@@ -45,6 +79,7 @@
       "init": {
         "title": "Opzioni E-Distribuzione",
         "menu_options": {
+          "riautentica": "Riautentica account",
           "tipo_pod": "Tipo di contatore per POD",
           "aggiungi_pod": "Aggiungi POD",
           "rimuovi_pod": "Rimuovi POD",
@@ -81,11 +116,26 @@
       "non_puoi_rimuoverli_tutti": "Non puoi rimuovere tutti i POD da qui: rimuovi direttamente l'integrazione se vuoi svuotarla del tutto"
     },
     "abort": {
+      "reauth_started": "Riautenticazione avviata. Torna alla scheda dell'integrazione E-Distribuzione e seleziona Riautentica nella notifica di attenzione richiesta.",
       "nessun_pod": "Non ci sono POD configurati da rimuovere",
       "nessun_pod_selezionato": "Seleziona almeno un POD da aggiungere",
       "nessun_pod_da_aggiungere": "Tutti i POD del tuo account sono già configurati qui",
       "refresh_failed": "Non è stato possibile rinnovare l'accesso a E-Distribuzione. Riprova più tardi; se il problema persiste potrebbe servire un nuovo login (rimuovi e riconfigura l'integrazione).",
       "supplies_failed": "Errore imprevisto nel recupero dei POD dall'account. Riprova più tardi."
+    }
+  },
+  "issues": {
+    "antibot_refresh_blocked": {
+      "title": "Accesso a E-Distribuzione temporaneamente bloccato",
+      "description": "La protezione anti-bot di E-Distribuzione sta impedendo il rinnovo automatico dell'accesso per **{entry_title}**. I dati non verranno aggiornati finché il blocco non termina.\n\nNon è necessariamente un problema di password. Evita tentativi ravvicinati, esci dall'app e dal sito ufficiale E-Distribuzione, attendi qualche ora e riprova senza VPN o proxy. Questa segnalazione scomparirà automaticamente quando il rinnovo tornerà a funzionare.",
+      "fix_flow": {
+        "step": {
+          "init": {
+            "title": "Riautentica E-Distribuzione",
+            "description": "Avvia una nuova autenticazione per **{entry_title}**. Se compare ancora la schermata anti-bot, interrompi i tentativi e riprova dopo qualche ora. Premi **Invia** per continuare."
+          }
+        }
+      }
     }
   }
 }

@@ -74,13 +74,14 @@ from __future__ import annotations
 import logging
 import re
 from collections import defaultdict
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 from homeassistant.components.recorder import get_instance
 from homeassistant.components.recorder.models import StatisticMeanType
 from homeassistant.components.recorder.statistics import (
     async_add_external_statistics,
     get_last_statistics,
+    statistics_during_period,
 )
 from homeassistant.core import HomeAssistant
 from homeassistant.util import dt as dt_util
@@ -103,6 +104,44 @@ def statistic_ids(pod: str) -> tuple[str, str]:
     pubblico per chi (es. energy_dashboard.py) deve sapere quali statistiche
     esistono per un POD senza replicare la logica di naming."""
     return _sanitize_statistic_id(pod), _sanitize_statistic_id(pod, immessa=True)
+
+
+async def _sum_precedente(hass: HomeAssistant, statistic_id: str, inizio: datetime) -> float:
+    """Sum cumulativa già presente nel Recorder nell'ora immediatamente
+    PRECEDENTE a 'inizio' (il primo bucket orario ricostruito da raw_storage),
+    oppure 0.0 se prima non c'è nulla.
+
+    raw_storage è la source of truth, ma la serie nel Recorder può COMINCIARE
+    PRIMA: dati importati da una versione precedente dell'integrazione (quando
+    raw_storage non esisteva), o storico recuperato a mano su una macchina e
+    non sull'altra. Se in quel caso la sum ricalcolata ripartisse da zero, la
+    prima ora ricostruita mostrerebbe un salto pari a TUTTO lo storico
+    accumulato fino a lì: osservato dal vivo, -4386 kWh in un giorno da ~22
+    kWh, esattamente sul primo giorno del periodo importato (e il salto si
+    spostava sul nuovo primo giorno ad ogni recupero storico più vecchio).
+
+    Saldando la nuova porzione sulla sum precedente la serie resta continua e
+    lo storico più vecchio di raw_storage non viene perso. L'offset è un dato
+    congelato (ore già passate, mai riscritte da noi: scriviamo solo da
+    'inizio' in avanti), quindi il risultato resta deterministico.
+    """
+    # Si guarda indietro un mese, non tutta la serie - basta per
+    # scavalcare qualche giorno mancante nel Recorder senza rileggere anni di
+    # righe. Se mai riapparisse un salto sul primo giorno, allargare qui.
+    dati = await get_instance(hass).async_add_executor_job(
+        statistics_during_period,
+        hass,
+        inizio - timedelta(days=31),
+        inizio,
+        {statistic_id},
+        "hour",
+        None,
+        {"sum"},
+    )
+    righe = dati.get(statistic_id)
+    if not righe:
+        return 0.0
+    return righe[-1].get("sum") or 0.0
 
 
 def _aggrega_ore(campioni: list[tuple[datetime, float]]) -> list[tuple[datetime, float]]:
@@ -192,7 +231,7 @@ async def async_import_curva_giornaliera(
         return None
 
     statistic_id = _sanitize_statistic_id(pod, immessa=immessa)
-    running_sum = 0.0
+    running_sum = await _sum_precedente(hass, statistic_id, ore[0][0])
     stats = []
     for inizio_ora, kwh in ore:
         running_sum += kwh

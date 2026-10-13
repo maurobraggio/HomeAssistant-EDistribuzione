@@ -8,6 +8,19 @@ statistiche esterne, visibili nella Energy Dashboard:
 - **prelevata** (consumo dalla rete)
 - **immessa** (immissione in rete / produzione fotovoltaica)
 
+Il download automatico usa normalmente le API dati dell'app ufficiale. Se
+quel backend risponde con un errore e la configurazione contiene un solo POD,
+l'integrazione apre automaticamente una sessione del portale web usando lo
+stesso token OAuth, recupera i dati usati dall'esportazione CSV della pagina
+"Curve di carico" e li importa nella stessa pipeline. Non occorre scaricare o
+caricare file a mano.
+
+Il fallback web non viene attivato su configurazioni con più POD: il
+controller Aura del portale non riceve il POD tra i parametri e attribuire la
+risposta al contatore sbagliato corromperebbe le statistiche. In quel caso
+l'API dell'app resta l'unico backend automatico finché non sarà identificata
+e verificata la chiamata con cui il portale seleziona il POD.
+
 Ogni POD ha un **ruolo** configurabile (contatore normale/scambio, oppure
 fotovoltaico/produzione): influenza solo i nomi mostrati, non quali dati
 vengono scaricati - entrambe le direzioni si acquisiscono sempre, per ogni
@@ -34,8 +47,35 @@ Copia `custom_components/edistribuzione/` nella cartella
 
 *Impostazioni → Dispositivi e servizi → Aggiungi integrazione → E-Distribuzione.*
 
-Serve: email e password dell'area clienti E-Distribuzione, e il codice OTP
-che ricevi via email o SMS durante la configurazione.
+Il metodo consigliato completa l'autorizzazione nel browser e non consegna la
+password a Home Assistant:
+
+1. accedi al Portale Clienti E-Distribuzione nel browser;
+2. dall'integrazione apri il link di autorizzazione ufficiale;
+3. al termine può rimanere una pagina bianca, perché Chrome desktop non
+   gestisce il protocollo mobile `eneldist://`; apri la Console JavaScript
+   (`⌥⌘J` su macOS), copia dall'errore il collegamento completo
+   `eneldist://redirect?...` e incollalo nel modulo Home Assistant;
+4. premi **Invia**. Access token e refresh token arrivano nello stesso
+   redirect: non sono più necessari una seconda pagina XML o un secondo
+   copia/incolla.
+
+Il redirect è legato al tentativo corrente tramite `state` OAuth e viene
+rifiutato se appartiene a un flusso precedente. I token vengono conservati
+nella config entry di Home Assistant; password e OTP non vengono memorizzati.
+
+Resta disponibile come alternativa il login diretto con email, password e
+OTP. La protezione anti-bot di E-Distribuzione può però bloccare le richieste
+eseguite dal container: in quel caso l'integrazione propone automaticamente
+il percorso nel browser e crea una segnalazione in *Sistema → Riparazioni*.
+
+Per aggiornare le credenziali senza cancellare POD, opzioni o storico:
+*Impostazioni → Dispositivi e servizi → E-Distribuzione → Configura →
+Riautentica account*.
+
+Una volta configurata, l'acquisizione è automatica: Home Assistant rinnova
+l'accesso, scarica le curve, normalizza i dati e aggiorna le statistiche. Non
+è richiesto alcun download o caricamento manuale di CSV.
 
 ## Configurazione del ruolo POD
 
@@ -71,7 +111,7 @@ ricalcolano i bucket orari e la somma cumulativa che vanno nella Energy
 Dashboard:
 
 ```
-API E-Distribuzione (15')  ->  raw storage (upsert)  ->  bucket orari + sum  ->  Energy Dashboard
+API app / portale web (15')  ->  raw storage (upsert)  ->  bucket orari + sum  ->  Energy Dashboard
 ```
 
 Questo rende ogni import **idempotente e capace di autocorreggersi**: se
@@ -123,8 +163,9 @@ python3 -m venv .venv
 
 ## Origine
 
-Il protocollo (login OAuth2+PKCE+OTP via Salesforce, client REST MuleSoft
-per i dati) è stato reverse-engineered per l'integrazione multi-distributore
+Il protocollo (OAuth2 Salesforce, login OTP, client REST MuleSoft e fallback
+Aura del portale per i dati) è stato reverse-engineered per l'integrazione
+multi-distributore
 [HomeAssistant-Contatore](https://github.com/riccardorossi92/HomeAssistant-Contatore),
 che resta la scelta giusta per chi ha anche Duereti, Unareti o Areti. Questo
 repository è dedicato solo a E-Distribuzione, con supporto nativo per

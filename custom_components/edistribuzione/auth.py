@@ -37,9 +37,10 @@ import logging
 import re
 import secrets
 import uuid
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
-from urllib.parse import unquote
+from urllib.parse import parse_qs, unquote, urlencode, urlparse
 
 import aiohttp
 
@@ -58,6 +59,11 @@ _LOGGER = logging.getLogger(__name__)
 _MOBILE_USER_AGENT = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15"
 
 _MAX_REDIRECT_HOPS = 15
+
+# Titolo della pagina di blocco anti-bot Imperva (ex Distil Networks). Il
+# portale può restituirla con HTTP 200 direttamente da oauth2/authorize,
+# quindi lo status code da solo non permette di distinguerla dal login vero.
+_RE_PAGINA_ANTIBOT = re.compile(r"Pardon\s+Our\s+Interruption", re.IGNORECASE)
 
 # Nomi di campo di fallback del form RichFaces del login flow, usati solo se
 # _analizza_pagina_otp non riesce a scoprirli dinamicamente dalla pagina reale
@@ -176,6 +182,22 @@ class TroppeSessioni(AuthError):
     """
 
 
+class BloccoAntibot(AuthError):
+    """Il portale ha fermato il login con la pagina anti-bot Imperva.
+
+    Non indica credenziali errate né un cambiamento del markup Salesforce:
+    la richiesta è stata bloccata prima di raggiungere la pagina di login.
+    """
+
+
+class InvalidRefreshToken(AuthError):
+    """Il refresh token è scaduto o revocato e richiede un nuovo login."""
+
+
+class InvalidBrowserRedirect(AuthError):
+    """L'URL finale del login nel browser non è valido per questo flusso."""
+
+
 class ParsingError(AuthError):
     """La pagina scrapata non conteneva quanto ci si aspettava.
 
@@ -268,6 +290,14 @@ class OAuthTokens:
     raw: dict = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class BrowserTokenExchange:
+    """Dati monouso da consegnare alla pagina locale tramite URL fragment."""
+
+    code: str
+    code_verifier: str
+
+
 class AuthClient:
     """Guida la sequenza login -> OTP -> code OAuth -> scambio token."""
 
@@ -281,6 +311,178 @@ class AuthClient:
         # ci si è arrivati. Il config flow lo usa per avvisare l'utente
         # invece di lasciarlo aspettare un OTP che non arriverà mai.
         self.otp_invio_confermato: bool | None = None
+
+    def _prepara_parametri_oauth(
+        self, email: str | None, *, forza_login: bool
+    ) -> dict[str, str]:
+        """Genera una nuova richiesta OAuth Authorization Code + PKCE.
+
+        Il verifier resta esclusivamente in memoria dentro Home Assistant;
+        nel browser viaggiano soltanto challenge e state. ``forza_login``
+        aggiunge il parametro richiesto da Experience Cloud quando viene
+        inviato anche ``login_hint``.
+        """
+        self._code_verifier, code_challenge = _make_pkce_pair()
+        self._oauth_state = _b64url(secrets.token_bytes(16))
+        params = {
+            "nonce": _b64url(secrets.token_bytes(16)),
+            "display": "touch",
+            "response_type": "code",
+            "scope": OAUTH_SCOPE,
+            "code_challenge": code_challenge,
+            "code_challenge_method": "S256",
+            "redirect_uri": OAUTH_REDIRECT_URI,
+            "client_id": OAUTH_CLIENT_ID,
+            "state": self._oauth_state,
+        }
+        if email:
+            params["login_hint"] = email
+        if forza_login:
+            params["prompt"] = "login"
+        return params
+
+    def prepare_browser_authorization_url(self) -> str:
+        """URL da aprire in un browser reale quando Imperva blocca aiohttp.
+
+        Non invia ``login_hint`` né ``prompt=login``: Salesforce può così
+        riusare la sessione del portale già autenticata nello stesso browser.
+        Se non esiste una sessione, mostrerà comunque il normale login web.
+        Inviare ``login_hint`` senza il corretto contesto Experience Cloud
+        può invece far finire lo startURL percent-encoded nel campo utente.
+        """
+        params = self._prepara_parametri_oauth(None, forza_login=False)
+        return f"{OAUTH_AUTHORIZE_URL}?{urlencode(params)}"
+
+    def prepare_browser_token_authorization_url(self) -> str:
+        """OAuth user-agent flow per il browser desktop.
+
+        Salesforce può restituire access e refresh token direttamente nel
+        fragment del redirect a un protocollo custom. In questo modo il
+        percorso anti-bot non deve più fare un secondo POST al token endpoint
+        e non richiede il successivo copia/incolla della risposta XML.
+        """
+        self._code_verifier = None
+        self._oauth_state = _b64url(secrets.token_bytes(16))
+        params = {
+            "nonce": _b64url(secrets.token_bytes(16)),
+            "display": "touch",
+            "response_type": "token",
+            "scope": OAUTH_SCOPE,
+            "redirect_uri": OAUTH_REDIRECT_URI,
+            "client_id": OAUTH_CLIENT_ID,
+            "state": self._oauth_state,
+        }
+        return f"{OAUTH_AUTHORIZE_URL}?{urlencode(params)}"
+
+    def tokens_from_browser_redirect(self, redirect_url: str) -> OAuthTokens:
+        """Valida un redirect user-agent e ne estrae i token dal fragment."""
+        if self._oauth_state is None:
+            raise InvalidBrowserRedirect("Sessione OAuth browser non inizializzata")
+
+        redirect_url = redirect_url.strip().strip("'\"")
+        parsed = urlparse(redirect_url)
+        expected = urlparse(OAUTH_REDIRECT_URI)
+        if parsed.scheme != expected.scheme or parsed.netloc != expected.netloc:
+            raise InvalidBrowserRedirect(
+                f"URL atteso {OAUTH_REDIRECT_URI}, ricevuto uno schema o host diverso"
+            )
+
+        valori = parse_qs(parsed.fragment or parsed.query)
+        if valori.get("error"):
+            descrizione = valori.get("error_description", valori["error"])[0]
+            raise InvalidBrowserRedirect(f"Autorizzazione negata: {descrizione}")
+        if valori.get("state", [None])[0] != self._oauth_state:
+            raise InvalidBrowserRedirect(
+                "Parametro state non valido: il link appartiene a un altro tentativo"
+            )
+
+        payload = {chiave: contenuti[0] for chiave, contenuti in valori.items()}
+        try:
+            return self._tokens_from_payload(payload)
+        except ParsingError as err:
+            raise InvalidBrowserRedirect(
+                "Il redirect non contiene access_token e refresh_token"
+            ) from err
+
+    def prepare_browser_token_exchange(self, redirect_url: str) -> BrowserTokenExchange:
+        """Convalida l'URL ``eneldist://`` e prepara lo scambio nel browser.
+
+        La verifica stretta dello state lega il redirect proprio al flow HA
+        che ha generato il link; un URL di un altro tentativo viene respinto.
+        """
+        if self._code_verifier is None or self._oauth_state is None:
+            raise InvalidBrowserRedirect("Sessione PKCE browser non inizializzata")
+
+        parsed = urlparse(redirect_url.strip())
+        expected = urlparse(OAUTH_REDIRECT_URI)
+        if parsed.scheme != expected.scheme or parsed.netloc != expected.netloc:
+            raise InvalidBrowserRedirect(
+                f"URL atteso {OAUTH_REDIRECT_URI}, ricevuto uno schema o host diverso"
+            )
+
+        query = parse_qs(parsed.query)
+        if query.get("error"):
+            descrizione = query.get("error_description", query["error"])[0]
+            raise InvalidBrowserRedirect(f"Autorizzazione negata: {descrizione}")
+
+        code = query.get("code", [None])[0]
+        state = query.get("state", [None])[0]
+        if not code:
+            raise InvalidBrowserRedirect("Parametro code assente dall'URL finale")
+        if state != self._oauth_state:
+            raise InvalidBrowserRedirect(
+                "Parametro state non valido: il link appartiene a un altro tentativo"
+            )
+        return BrowserTokenExchange(code=code, code_verifier=self._code_verifier)
+
+    async def async_exchange_browser_redirect(self, redirect_url: str) -> OAuthTokens:
+        """Compatibilità/test: scambia server-side un redirect già validato."""
+        exchange = self.prepare_browser_token_exchange(redirect_url)
+        return await self._async_exchange_code(exchange.code)
+
+    @staticmethod
+    def tokens_from_browser_payload(raw: str) -> OAuthTokens:
+        """Valida la risposta JSON/XML restituita dal token endpoint.
+
+        Una navigazione form del browser chiede normalmente XML a Salesforce.
+        Chrome antepone al testo copiato una breve spiegazione del visualizzatore
+        XML: si estrae quindi il solo elemento ``<OAuth>`` prima del parsing.
+        """
+        raw = raw.strip()
+        if raw.startswith("{"):
+            try:
+                payload = json.loads(raw)
+            except json.JSONDecodeError as err:
+                raise InvalidBrowserRedirect(
+                    "Il risultato incollato non è JSON valido"
+                ) from err
+        else:
+            xml_match = re.search(r"<OAuth(?:\s[^>]*)?>.*?</OAuth>", raw, re.DOTALL)
+            if xml_match is None:
+                raise InvalidBrowserRedirect(
+                    "Il risultato incollato non contiene una risposta OAuth JSON o XML"
+                )
+            try:
+                root = ET.fromstring(xml_match.group(0))
+            except ET.ParseError as err:
+                raise InvalidBrowserRedirect(
+                    "La risposta OAuth XML non è valida"
+                ) from err
+            payload = {
+                child.tag.rsplit("}", 1)[-1]: child.text or "" for child in root
+            }
+        if not isinstance(payload, dict):
+            raise InvalidBrowserRedirect("Il risultato OAuth non è un oggetto")
+        if payload.get("error"):
+            raise InvalidBrowserRedirect(
+                f"Token endpoint: {payload.get('error_description') or payload['error']}"
+            )
+        try:
+            return AuthClient._tokens_from_payload(payload)
+        except ParsingError as err:
+            raise InvalidBrowserRedirect(
+                "Nella risposta mancano access_token o refresh_token"
+            ) from err
 
     # -- Passo 1-4: login + OTP -------------------------------------------
 
@@ -308,28 +510,31 @@ class AuthClient:
 
         Ritorna (login_page_html, start_url_value, aura_page_uri, referer).
         """
-        self._code_verifier, code_challenge = _make_pkce_pair()
-        self._oauth_state = _b64url(secrets.token_bytes(16))
-
         headers = {"User-Agent": _MOBILE_USER_AGENT}
-        params = {
-            "prompt": "login",
-            "nonce": _b64url(secrets.token_bytes(16)),
-            "display": "touch",
-            "response_type": "code",
-            "scope": OAUTH_SCOPE,
-            "login_hint": email,
-            "code_challenge": code_challenge,
-            "code_challenge_method": "S256",
-            "redirect_uri": OAUTH_REDIRECT_URI,
-            "client_id": OAUTH_CLIENT_ID,
-            "state": self._oauth_state,
-        }
+        params = self._prepara_parametri_oauth(email, forza_login=True)
 
         resp = await _get_following_redirects(
             self._session, OAUTH_AUTHORIZE_URL, params=params, headers=headers
         )
         login_page_html = await resp.text()
+        landing_status = resp.status
+        landing_url = str(resp.url.with_query(None))
+        resp.close()
+
+        if _RE_PAGINA_ANTIBOT.search(login_page_html):
+            _LOGGER.warning(
+                "E-Distribuzione ha risposto con la pagina anti-bot Imperva "
+                '("Pardon Our Interruption", HTTP %s su %s) invece che con '
+                "la pagina di login",
+                landing_status,
+                landing_url,
+            )
+            _salva_pagina_debug(login_page_html, "login_page_debug.html")
+            raise BloccoAntibot(
+                "Richiesta bloccata dalla protezione anti-bot del portale "
+                f"(HTTP {landing_status} su {landing_url})"
+            )
+
         # Il parametro 'startURL' della pagina su cui atterriamo contiene un
         # token 'source=...' generato dal server al primo hop, che il server
         # pretende di riavere indietro nel campo 'startUrl' del passo
@@ -342,7 +547,6 @@ class AuthClient:
         )
         aura_page_uri = resp.url.path_qs
         referer = str(resp.url)
-        resp.close()
         return login_page_html, start_url_value, aura_page_uri, referer
 
     async def _invia_credenziali(
@@ -795,6 +999,27 @@ class AuthClient:
         async with self._session.post(OAUTH_TOKEN_URL, data=data) as resp:
             if resp.status != 200:
                 text = await resp.text()
+                try:
+                    errore_oauth = json.loads(text).get("error")
+                except (json.JSONDecodeError, AttributeError):
+                    errore_oauth = None
+                if errore_oauth == "invalid_grant":
+                    raise InvalidRefreshToken(
+                        "Il refresh token E-Distribuzione è scaduto o è stato revocato"
+                    )
+                # Imperva può bloccare anche l'endpoint OAuth del refresh:
+                # in questo caso restituisce un 403/429 con una pagina HTML
+                # (spesso con robots/noindex), non un errore OAuth JSON. Non
+                # riversiamo l'intera pagina nell'errore mostrato da Home
+                # Assistant: è uno stato operativo riconoscibile e richiede
+                # un avviso dedicato nelle Riparazioni.
+                sembra_html = "<html" in text.lower() or "<meta" in text.lower()
+                if _RE_PAGINA_ANTIBOT.search(text) or (
+                    resp.status in (403, 429) and sembra_html
+                ):
+                    raise BloccoAntibot(
+                        "E-Distribuzione ha bloccato temporaneamente il rinnovo dell'accesso"
+                    )
                 raise AuthError(f"Scambio del refresh_token fallito ({resp.status}): {text[:300]}")
             payload = await resp.json(content_type=None)
         # Salesforce non restituisce sempre un nuovo refresh_token al

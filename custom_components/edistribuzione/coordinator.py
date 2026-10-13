@@ -26,17 +26,23 @@ from datetime import date, timedelta
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
-from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.exceptions import (
+    ConfigEntryAuthFailed,
+    HomeAssistantError,
+    ServiceValidationError,
+)
+from homeassistant.helpers.aiohttp_client import async_create_clientsession, async_get_clientsession
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.util import dt as dt_util
 
 from .api import ApiClient, ApiError
-from .auth import AuthClient, AuthError
+from .auth import AuthClient, AuthError, BloccoAntibot, InvalidRefreshToken
 from .const import (
     ABBANDONO_CODA_DOPO_GIORNI,
+    CONF_ACCESS_TOKEN,
     CONF_DATA_INSTALLAZIONE,
     CONF_GIORNI_DA_RIPROVARE,
+    CONF_INSTANCE_URL,
     CONF_ORA_RICHIESTA,
     CONF_PODS,
     CONF_REFRESH_TOKEN,
@@ -54,6 +60,8 @@ from .const import (
     TIPO_POD_DEFAULT,
     TIPO_POD_PRODUZIONE,
 )
+from .portal import PortalApiError, PortalClient
+from .repairs import async_create_antibot_issue, async_delete_antibot_issue
 from .statistics import async_get_ultima_data_disponibile, async_import_curva_giornaliera
 
 _LOGGER = logging.getLogger(__name__)
@@ -135,6 +143,10 @@ class EdistribuzioneCoordinator(DataUpdateCoordinator[dict]):
         session = async_get_clientsession(hass)
         self._auth = AuthClient(session)
         self._api = ApiClient(session, access_token="")
+        # Il portale richiede cookie di sessione; la sessione condivisa di
+        # Home Assistant non va usata per questo scopo. La sessione dedicata
+        # viene chiusa automaticamente dall'helper allo stop di HA.
+        self._portal = PortalClient(async_create_clientsession(hass))
 
     def tipo_pod(self, pod: str) -> str:
         """Ruolo assegnato dall'utente al POD (scambio/produzione), dalle
@@ -152,23 +164,74 @@ class EdistribuzioneCoordinator(DataUpdateCoordinator[dict]):
             )
         return f"E-Distribuzione {pod} - immissione" if immessa else f"E-Distribuzione {pod} - prelievo"
 
-    async def _async_ensure_token(self) -> None:
+    async def _async_ensure_token(self, *, force_refresh: bool = False) -> None:
+        """Configura i client con un access token utilizzabile.
+
+        Il token ottenuto dal browser viene conservato apposta: il relativo
+        refresh server-side può essere intercettato da Imperva anche pochi
+        secondi dopo un login riuscito. Si prova quindi il token già emesso e
+        si ricorre al refresh soltanto quando manca o quando l'API restituisce
+        esplicitamente 401.
+        """
+        access_token = self.entry.data.get(CONF_ACCESS_TOKEN)
+        if access_token and not force_refresh:
+            self._api.update_token(access_token)
+            self._portal.update_token(
+                access_token, self.entry.data.get(CONF_INSTANCE_URL, "")
+            )
+            async_delete_antibot_issue(self.hass, self.entry.entry_id)
+            return
+
         refresh_token = self.entry.data[CONF_REFRESH_TOKEN]
         try:
             tokens = await self._auth.async_refresh_access_token(refresh_token)
+        except InvalidRefreshToken as err:
+            # Fa comparire automaticamente in Home Assistant "Attenzione
+            # richiesta" con il pulsante Riautentica, che apre il flow già
+            # implementato senza cancellare POD, opzioni o storico.
+            raise ConfigEntryAuthFailed(
+                "Accesso E-Distribuzione scaduto: riautenticazione necessaria"
+            ) from err
+        except BloccoAntibot as err:
+            async_create_antibot_issue(self.hass, self.entry)
+            raise UpdateFailed(
+                "Accesso temporaneamente bloccato da E-Distribuzione; "
+                "consulta Impostazioni > Sistema > Riparazioni"
+            ) from err
         except AuthError as err:
-            # Un refresh fallito significa quasi certamente che il
-            # refresh_token è stato revocato (cambio password, pulizia
-            # sessioni lato Enel, ...) e l'utente deve rifare il login
-            # tramite il reauth del config_flow.
+            # Errori temporanei/indeterminati del token endpoint non devono
+            # chiedere inutilmente un nuovo login: il coordinator riproverà.
             raise UpdateFailed(f"Refresh del token fallito: {err}") from err
 
+        async_delete_antibot_issue(self.hass, self.entry.entry_id)
         self._api.update_token(tokens.access_token)
+        self._portal.update_token(tokens.access_token, tokens.instance_url)
 
-        if tokens.refresh_token != refresh_token:
-            new_data = dict(self.entry.data)
-            new_data[CONF_REFRESH_TOKEN] = tokens.refresh_token
+        new_data = {
+            **self.entry.data,
+            CONF_ACCESS_TOKEN: tokens.access_token,
+            CONF_REFRESH_TOKEN: tokens.refresh_token,
+            CONF_INSTANCE_URL: tokens.instance_url,
+        }
+        if new_data != self.entry.data:
             self.hass.config_entries.async_update_entry(self.entry, data=new_data)
+
+    async def _async_get_daily_load_profile(
+        self, pod: str, data_da: date, data_a: date, magnitude: str
+    ) -> list[dict]:
+        """Chiama il backend e rinnova il token una sola volta su 401."""
+        try:
+            return await self._api.async_get_daily_load_profile(
+                pod, data_da, data_a, magnitude=magnitude
+            )
+        except ApiError as err:
+            if err.status != 401:
+                raise
+
+        await self._async_ensure_token(force_refresh=True)
+        return await self._api.async_get_daily_load_profile(
+            pod, data_da, data_a, magnitude=magnitude
+        )
 
     # ------------------------------------------------------------------
     # Orario configurabile + coda dei giorni da riprovare, PER POD
@@ -390,9 +453,35 @@ class EdistribuzioneCoordinator(DataUpdateCoordinator[dict]):
         """
         risultati: dict[str, dict] = {}
         for magnitude in MAGNITUDE_TUTTE:
-            curva = await self._api.async_get_daily_load_profile(
-                pod, data_da, data_a, magnitude=magnitude
-            )
+            try:
+                curva = await self._async_get_daily_load_profile(
+                    pod, data_da, data_a, magnitude
+                )
+            except ApiError as errore_api:
+                # QueryLoadProfile non porta il POD tra i parametri: la UI
+                # lo conserva nel proprio contesto. Con più POD non è quindi
+                # possibile dimostrare a quale POD appartenga la risposta;
+                # meglio fallire che contaminare per sempre due statistiche.
+                if len(self.pods) != 1:
+                    raise ApiError(
+                        f"{errore_api}; fallback portale non sicuro con {len(self.pods)} "
+                        "POD configurati (il controller web non espone il POD richiesto)"
+                    ) from errore_api
+                _LOGGER.warning(
+                    "POD %s: backend API non disponibile per magnitude=%s (%s); "
+                    "provo automaticamente il portale web/CSV",
+                    pod,
+                    magnitude,
+                    errore_api,
+                )
+                try:
+                    curva = await self._portal.async_get_daily_load_profile(
+                        pod, data_da, data_a, magnitude
+                    )
+                except PortalApiError as errore_portale:
+                    raise ApiError(
+                        f"API mobile: {errore_api}; fallback portale: {errore_portale}"
+                    ) from errore_portale
             if not _curva_ha_dati(curva):
                 continue
             if not _magnitude_onorata(curva, magnitude):

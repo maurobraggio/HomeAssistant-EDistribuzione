@@ -278,8 +278,15 @@ class TestAsyncGetDailyLoadProfile:
 
     async def test_401_solleva_errore_specifico(self):
         client, _ = _client({"querydailyloadprofile": (401, {})})
-        with pytest.raises(api.ApiError, match="401"):
+        with pytest.raises(api.ApiError, match="401") as exc_info:
             await client.async_get_daily_load_profile("IT001E12345678", datetime.date(2026, 8, 1))
+        assert exc_info.value.status == 401
+
+    async def test_500_diventa_api_error_per_attivare_il_fallback(self):
+        client, _ = _client({"querydailyloadprofile": (500, "errore temporaneo")})
+        with pytest.raises(api.ApiError, match="HTTP 500") as exc_info:
+            await client.async_get_daily_load_profile("IT001E12345678", datetime.date(2026, 8, 1))
+        assert exc_info.value.status == 500
 
     async def test_meta_status_ko_solleva_errore(self):
         client, _ = _client(

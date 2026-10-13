@@ -9,11 +9,15 @@ documentato in documentation/protocol.md.
 """
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import pytest
 from homeassistant.components.recorder import get_instance
-from homeassistant.components.recorder.statistics import statistics_during_period
+from homeassistant.components.recorder.models import StatisticMeanType
+from homeassistant.components.recorder.statistics import (
+    async_add_external_statistics,
+    statistics_during_period,
+)
 from homeassistant.util import dt as dt_util
 from pytest_homeassistant_custom_component.components.recorder.common import (
     async_recorder_block_till_done,
@@ -305,3 +309,60 @@ async def test_reimport_di_un_periodo_piu_ampio_non_perde_ore_precedenti(recorde
     prima_ora_giorno2 = _ora("2026-08-01T22:00:00+00:00")
     assert ore[ultima_ora_giorno1]["sum"] == pytest.approx(24.0)
     assert ore[prima_ora_giorno2]["sum"] == pytest.approx(25.0)
+
+
+async def test_serie_preesistente_piu_vecchia_di_raw_storage_non_riparte_da_zero(
+    recorder_mock, hass
+):
+    """Regressione: 4.4 MWh di anomalia sul primo giorno del periodo importato.
+
+    Nel Recorder può esistere storico PIU' VECCHIO di qualunque campione in
+    raw_storage (importato da una versione precedente dell'integrazione, quando
+    raw_storage non c'era). Ricalcolando da raw_storage con la sum che riparte
+    da zero, la prima ora ricostruita crollava dalla sum accumulata a ~0: la
+    Energy Dashboard leggeva quel salto come il consumo/produzione di quel
+    giorno (osservato: -4386 kWh su un giorno da ~22 kWh), e il salto si
+    spostava sul nuovo primo giorno ad ogni recupero storico più vecchio.
+    """
+    pod = "IT001E00000014"
+    statistic_id = st._sanitize_statistic_id(pod)
+
+    # Storico preesistente nel solo Recorder: 24 ore del 31 luglio locale, sum
+    # già arrivata a 5000 kWh. raw_storage resta vuoto, come per i dati
+    # importati prima che esistesse.
+    vecchie = [
+        {
+            "start": _ora("2026-07-30T22:00:00+00:00") + timedelta(hours=i),
+            "state": 1.0,
+            "sum": 4977.0 + i,
+        }
+        for i in range(24)
+    ]
+    async_add_external_statistics(
+        hass,
+        {
+            "has_mean": False,
+            "mean_type": StatisticMeanType.NONE,
+            "has_sum": True,
+            "name": None,
+            "source": st.DOMAIN,
+            "statistic_id": statistic_id,
+            "unit_of_measurement": "kWh",
+            "unit_class": "energy",
+        },
+        vecchie,
+    )
+    await async_recorder_block_till_done(hass)
+
+    await st.async_import_curva_giornaliera(hass, pod, [_giorno(*AGOSTO, [0.25] * 96)])
+    await async_recorder_block_till_done(hass)
+
+    ore = await _leggi_statistiche(hass, statistic_id)
+    ultima_vecchia = _ora("2026-07-31T21:00:00+00:00")
+    prima_nuova = _ora("2026-07-31T22:00:00+00:00")
+
+    assert ore[ultima_vecchia]["sum"] == pytest.approx(5000.0)
+    # 1.0 kWh/ora: la serie prosegue da 5000, non riparte da 1.0.
+    assert ore[prima_nuova]["state"] == pytest.approx(1.0)
+    assert ore[prima_nuova]["sum"] == pytest.approx(5001.0)
+    assert ore[_ora("2026-08-01T21:00:00+00:00")]["sum"] == pytest.approx(5024.0)

@@ -15,6 +15,7 @@ import importlib.util
 import sys
 import types
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 import pytest
 
@@ -42,6 +43,136 @@ def _load_auth_module():
 
 
 auth = _load_auth_module()
+
+
+# ---------------------------------------------------------------------------
+# Login OAuth nel browser (fallback anti-bot)
+# ---------------------------------------------------------------------------
+
+
+class TestBrowserOAuth:
+    def test_url_contiene_pkce_state_e_non_il_verifier(self):
+        client = auth.AuthClient(session=None)
+        url = client.prepare_browser_authorization_url()
+        query = parse_qs(urlparse(url).query)
+
+        assert query["redirect_uri"] == ["eneldist://redirect"]
+        assert query["code_challenge_method"] == ["S256"]
+        assert "login_hint" not in query
+        assert "prompt" not in query
+        assert client._code_verifier not in url
+
+    def test_url_user_agent_restituisce_token_e_non_usa_pkce(self):
+        client = auth.AuthClient(session=None)
+        url = client.prepare_browser_token_authorization_url()
+        query = parse_qs(urlparse(url).query)
+
+        assert query["response_type"] == ["token"]
+        assert query["redirect_uri"] == ["eneldist://redirect"]
+        assert "code_challenge" not in query
+        assert "login_hint" not in query
+
+    def test_redirect_user_agent_valido_contiene_entrambi_i_token(self):
+        client = auth.AuthClient(session=None)
+        url = client.prepare_browser_token_authorization_url()
+        state = parse_qs(urlparse(url).query)["state"][0]
+
+        tokens = client.tokens_from_browser_redirect(
+            "eneldist://redirect#access_token=access%21ok&"
+            "refresh_token=refresh%3Dok&"
+            "instance_url=https%3A%2F%2Fexample.my.salesforce.com&"
+            f"state={state}"
+        )
+
+        assert tokens.access_token == "access!ok"
+        assert tokens.refresh_token == "refresh=ok"
+        assert tokens.instance_url == "https://example.my.salesforce.com"
+
+    def test_redirect_user_agent_con_state_diverso_viene_respinto(self):
+        client = auth.AuthClient(session=None)
+        client.prepare_browser_token_authorization_url()
+
+        with pytest.raises(auth.InvalidBrowserRedirect, match="state"):
+            client.tokens_from_browser_redirect(
+                "eneldist://redirect#access_token=a&refresh_token=r&state=altro"
+            )
+
+    async def test_redirect_valido_scambia_il_code(self):
+        client = auth.AuthClient(session=None)
+        url = client.prepare_browser_authorization_url()
+        state = parse_qs(urlparse(url).query)["state"][0]
+        codici = []
+
+        async def _scambia(code):
+            codici.append(code)
+            return "tokens"
+
+        client._async_exchange_code = _scambia
+        risultato = await client.async_exchange_browser_redirect(
+            f"eneldist://redirect?code=CODICE%2BOK&state={state}"
+        )
+
+        assert risultato == "tokens"
+        assert codici == ["CODICE+OK"]
+
+    def test_redirect_valido_prepara_scambio_browser(self):
+        client = auth.AuthClient(session=None)
+        url = client.prepare_browser_authorization_url()
+        state = parse_qs(urlparse(url).query)["state"][0]
+
+        exchange = client.prepare_browser_token_exchange(
+            f"eneldist://redirect?code=CODICE%2BOK&state={state}"
+        )
+
+        assert exchange.code == "CODICE+OK"
+        assert exchange.code_verifier == client._code_verifier
+
+    def test_json_token_browser_valido(self):
+        tokens = auth.AuthClient.tokens_from_browser_payload(
+            '{"access_token":"access","refresh_token":"refresh",'
+            '"instance_url":"https://example.my.salesforce.com"}'
+        )
+
+        assert tokens.access_token == "access"
+        assert tokens.refresh_token == "refresh"
+
+    def test_xml_token_browser_valido_con_prefisso_di_chrome(self):
+        tokens = auth.AuthClient.tokens_from_browser_payload(
+            "This XML file does not appear to have any style information.\n"
+            "\ufffc<OAuth><access_token>access</access_token>"
+            "<refresh_token>refresh</refresh_token>"
+            "<instance_url>https://example.my.salesforce.com</instance_url></OAuth>"
+        )
+
+        assert tokens.access_token == "access"
+        assert tokens.refresh_token == "refresh"
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            "non-json",
+            "[]",
+            '{"error":"invalid_grant","error_description":"expired"}',
+            '{"access_token":"senza-refresh"}',
+        ],
+    )
+    def test_json_token_browser_invalido(self, payload):
+        with pytest.raises(auth.InvalidBrowserRedirect):
+            auth.AuthClient.tokens_from_browser_payload(payload)
+
+    @pytest.mark.parametrize(
+        "redirect",
+        [
+            "https://example.com/?code=x&state=y",
+            "eneldist://redirect?state=y",
+            "eneldist://redirect?code=x&state=tentativo-vecchio",
+        ],
+    )
+    async def test_redirect_invalido_viene_respinto(self, redirect):
+        client = auth.AuthClient(session=None)
+        client.prepare_browser_authorization_url()
+        with pytest.raises(auth.InvalidBrowserRedirect):
+            await client.async_exchange_browser_redirect(redirect)
 
 
 # ---------------------------------------------------------------------------
@@ -264,6 +395,17 @@ class _RispostaFinta:
         return False
 
 
+class _RispostaLoginFinta(_RispostaFinta):
+    def __init__(self, status: int, url: str, body: str) -> None:
+        super().__init__(body)
+        self.status = status
+        self.url = auth.aiohttp.client.URL(url)
+        self.closed = False
+
+    def close(self) -> None:
+        self.closed = True
+
+
 class _SessioneFinta:
     """Minimo indispensabile per _async_post_form_otp: registra i dati
     inviati e restituisce sempre la stessa pagina."""
@@ -275,6 +417,20 @@ class _SessioneFinta:
     def post(self, url, data=None, headers=None):
         self.dati_inviati = data
         return _RispostaFinta(self._body)
+
+
+class _RispostaTokenFinta(_RispostaFinta):
+    def __init__(self, status: int, body: str) -> None:
+        super().__init__(body)
+        self.status = status
+
+
+class _SessioneTokenFinta:
+    def __init__(self, status: int, body: str) -> None:
+        self._risposta = _RispostaTokenFinta(status, body)
+
+    def post(self, url, data=None):
+        return self._risposta
 
 
 PAGINA_OTP_CON_CONFERMA = (
@@ -344,6 +500,76 @@ class TestInvioOtp:
         client = auth.AuthClient(session=None)
         with pytest.raises(auth.AuthError, match="async_begin_login"):
             await client.async_resend_otp()
+
+
+# ---------------------------------------------------------------------------
+# Pagina anti-bot al posto del login
+# ---------------------------------------------------------------------------
+
+
+async def test_pagina_antibot_solleva_eccezione_dedicata(monkeypatch, tmp_path):
+    """Imperva risponde 200 da oauth2/authorize ma non serve il login."""
+    monkeypatch.chdir(tmp_path)
+    risposta = _RispostaLoginFinta(
+        200,
+        "https://private.e-distribuzione.it/PortaleClienti/services/oauth2/"
+        "authorize?login_hint=mario%40example.com",
+        "<!DOCTYPE html><html><head><noscript>"
+        "<title>Pardon   Our\nInterruption</title></noscript></head></html>",
+    )
+
+    async def _finto_get(*args, **kwargs):
+        return risposta
+
+    monkeypatch.setattr(auth, "_get_following_redirects", _finto_get)
+    client = auth.AuthClient(session=None)
+
+    with pytest.raises(auth.BloccoAntibot) as exc_info:
+        await client.async_begin_login("mario@example.com", "pw")
+
+    assert not isinstance(exc_info.value, auth.ParsingError)
+    assert "mario" not in str(exc_info.value)
+    assert risposta.closed is True
+
+    dump = tmp_path / "login_page_debug.html"
+    for _ in range(50):
+        if dump.exists():
+            break
+        await asyncio.sleep(0.02)
+    assert dump.exists()
+
+
+async def test_invalid_grant_del_refresh_token_solleva_eccezione_dedicata():
+    client = auth.AuthClient(
+        _SessioneTokenFinta(
+            400,
+            '{"error":"invalid_grant","error_description":"expired token"}',
+        )
+    )
+
+    with pytest.raises(auth.InvalidRefreshToken):
+        await client.async_refresh_access_token("revocato")
+
+
+async def test_errore_temporaneo_del_token_endpoint_resta_auth_error_generico():
+    client = auth.AuthClient(_SessioneTokenFinta(503, "servizio non disponibile"))
+
+    with pytest.raises(auth.AuthError) as exc_info:
+        await client.async_refresh_access_token("ancora-valido")
+
+    assert not isinstance(exc_info.value, auth.InvalidRefreshToken)
+
+
+async def test_403_html_del_token_endpoint_e_riconosciuto_come_antibot():
+    client = auth.AuthClient(
+        _SessioneTokenFinta(
+            403,
+            '<html><head><meta name="ROBOTS" content="NOINDEX"></head></html>',
+        )
+    )
+
+    with pytest.raises(auth.BloccoAntibot, match="bloccato temporaneamente"):
+        await client.async_refresh_access_token("ancora-valido")
 
 
 # ---------------------------------------------------------------------------

@@ -32,6 +32,10 @@ _LOGGER = logging.getLogger(__name__)
 class ApiError(Exception):
     """Alzata quando l'API risponde con un meta.status non-OK o un errore di trasporto."""
 
+    def __init__(self, message: str, *, status: int | None = None) -> None:
+        super().__init__(message)
+        self.status = status
+
 
 class ApiClient:
     """Wrapper leggero sugli endpoint 'misure'. Auth/refresh è gestito a
@@ -61,7 +65,7 @@ class ApiClient:
             url, headers=self._headers(method_user), params=params
         ) as resp:
             if resp.status == 401:
-                raise ApiError("401 Unauthorized - access_token scaduto")
+                raise ApiError("401 Unauthorized - access_token scaduto", status=401)
             if resp.status == 404:
                 # Osservato chiedendo il giorno corrente all'01:01 (dati del
                 # giorno prima verosimilmente non ancora pubblicati): il
@@ -85,7 +89,13 @@ class ApiClient:
                     resp.status,
                     body_preview[:500],
                 )
-            resp.raise_for_status()
+                # Il coordinator può così attivare il fallback del portale
+                # anche per 403/429/5xx. Lasciare propagare il
+                # ClientResponseError grezzo saltava il ramo ``ApiError``.
+                raise ApiError(
+                    f"HTTP {resp.status} da {url} (corpo: {body_preview[:200]!r})",
+                    status=resp.status,
+                )
             payload = await resp.json(content_type=None)
 
         meta = payload.get("meta", {})

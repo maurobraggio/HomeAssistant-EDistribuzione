@@ -21,6 +21,7 @@ from homeassistant.exceptions import HomeAssistantError
 
 from custom_components.edistribuzione.api import ApiError
 from custom_components.edistribuzione.const import MAGNITUDE_PRELEVATA
+from custom_components.edistribuzione.portal import PortalApiError
 
 from .conftest import POD_A, POD_B
 
@@ -71,9 +72,48 @@ async def test_errore_api_su_tutti_i_pod_fa_fallire_l_azione(
     coordinator._api.async_get_daily_load_profile = AsyncMock(
         side_effect=ApiError("403 dal distributore")
     )
+    coordinator._portal.async_get_daily_load_profile = AsyncMock(
+        side_effect=PortalApiError("portale non disponibile")
+    )
 
     with freeze_time(OGGI), pytest.raises(HomeAssistantError, match="403 dal distributore"):
         await coordinator.async_recupera_storico(DATA_DA, DATA_A)
+
+
+async def test_errore_api_usa_fallback_portale_automatico(
+    hass, make_edist_coordinator, _senza_token, _import_statistiche
+):
+    coordinator = make_edist_coordinator(pods=[POD_A])
+    coordinator._api.async_get_daily_load_profile = AsyncMock(
+        side_effect=ApiError("backend mobile non disponibile")
+    )
+
+    async def _portale(pod, data_da, data_a, magnitude):
+        assert pod == POD_A
+        return _curva([data_da, data_a], energy_type=magnitude)
+
+    coordinator._portal.async_get_daily_load_profile = AsyncMock(side_effect=_portale)
+
+    with freeze_time(OGGI):
+        await coordinator.async_recupera_storico(DATA_DA, DATA_A)
+
+    assert coordinator._portal.async_get_daily_load_profile.await_count == 2
+    assert _import_statistiche.await_count == 2
+
+
+async def test_multi_pod_non_usa_portale_senza_selezione_pod_affidabile(
+    hass, make_edist_coordinator, _senza_token, _import_statistiche
+):
+    coordinator = make_edist_coordinator(pods=[POD_A, POD_B])
+    coordinator._api.async_get_daily_load_profile = AsyncMock(
+        side_effect=ApiError("backend mobile non disponibile")
+    )
+    coordinator._portal.async_get_daily_load_profile = AsyncMock()
+
+    with freeze_time(OGGI), pytest.raises(HomeAssistantError, match="fallback portale non sicuro"):
+        await coordinator.async_recupera_storico(DATA_DA, DATA_A, pod=POD_A)
+
+    coordinator._portal.async_get_daily_load_profile.assert_not_awaited()
 
 
 async def test_risposta_vuota_fa_fallire_l_azione(
